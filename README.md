@@ -34,10 +34,12 @@ You need Docker with the `docker compose` plugin.
 - **Totals:** cost, tokens, cache hit ratio, sessions, active time, lines of code
 - **Over time:** cost by model, tokens by type
 - **Breakdowns:** cost by repository, cost by source (main loop, subagents, skills, MCP servers), top sessions
-- **Tools:** calls, failure rate and latency per tool, permission decisions
-- **API:** errors by status code, latency
+- **Tools:** calls, failure rate and latency per tool, failed calls by error type, permission decisions
+- **API:** failed calls with status and message, errors over time, latency
 - **Git:** commits and pull requests made by Claude Code
 - **Skills:** activations over time, whether you or Claude triggered each skill, and sessions with no skills by repository
+- **MCP:** calls, failure rate and latency per server and tool, connection failures with their errors
+- **Hooks:** runs, errors and duration per hook, configured hooks and where they come from, hook time over time
 
 Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
 

@@ -647,7 +647,7 @@
         ]
       },
       "options": {},
-      "description": "MCP tools show as mcp_tool unless OTEL_LOG_TOOL_DETAILS=1."
+      "description": "All MCP calls count as mcp_tool here; MCP tool calls breaks them down by server and tool."
     },
     {
       "id": 13,
@@ -985,6 +985,360 @@
       },
       "options": {},
       "description": "Sessions where no skill ran, by repository: places to look for skills you could have used."
+    },
+    {
+      "id": 20,
+      "type": "table",
+      "title": "MCP tool calls",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT if(LogAttributes['mcp_server_name'] = '', '(not recorded)', LogAttributes['mcp_server_name']) AS server, LogAttributes['mcp_tool_name'] AS tool, count() AS calls, countIf(LogAttributes['success'] = 'false') / count() AS failure_rate, quantile(0.5)(toFloat64OrZero(LogAttributes['duration_ms'])) AS p50_ms, quantile(0.95)(toFloat64OrZero(LogAttributes['duration_ms'])) AS p95_ms, max(Timestamp) AS last_used FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'tool_result' AND $__timeFilter(Timestamp) AND LogAttributes['tool_name'] = 'mcp_tool' GROUP BY server, tool ORDER BY calls DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failure_rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "Server and tool names need OTEL_LOG_TOOL_DETAILS=1."
+    },
+    {
+      "id": 21,
+      "type": "table",
+      "title": "MCP connections",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT if(LogAttributes['server_name'] = '', '(not recorded)', LogAttributes['server_name']) AS server, any(LogAttributes['transport_type']) AS transport, countIf(LogAttributes['status'] = 'connected') AS connected, countIf(LogAttributes['status'] = 'failed') AS failed, quantileIf(0.95)(toFloat64OrZero(LogAttributes['duration_ms']), LogAttributes['status'] != 'disconnected') AS connect_p95_ms, argMaxIf(if(LogAttributes['error'] != '', LogAttributes['error'], LogAttributes['error_code']), Timestamp, LogAttributes['status'] = 'failed') AS last_error FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'mcp_server_connection' AND $__timeFilter(Timestamp) GROUP BY server ORDER BY failed DESC, connected DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Failed tool calls",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 10,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT if(LogAttributes['mcp_tool_name'] != '', concat(LogAttributes['mcp_server_name'], ' / ', LogAttributes['mcp_tool_name']), LogAttributes['tool_name']) AS tool, LogAttributes['error_type'] AS error_type, count() AS failures, max(Timestamp) AS last_seen FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'tool_result' AND $__timeFilter(Timestamp) AND LogAttributes['success'] = 'false' GROUP BY tool, error_type ORDER BY failures DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 23,
+      "type": "table",
+      "title": "Failed API calls",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 65,
+        "w": 14,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT Timestamp AS time, LogAttributes['model'] AS model, LogAttributes['status_code'] AS status, LogAttributes['error'] AS error, LogAttributes['attempt'] AS attempt, toFloat64OrZero(LogAttributes['duration_ms']) AS duration_ms, LogAttributes['query_source'] AS source FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'api_error' AND $__timeFilter(Timestamp) ORDER BY Timestamp DESC LIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "id": 24,
+      "type": "table",
+      "title": "Hooks",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 14,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT LogAttributes['hook_name'] AS hook, count() AS runs, sum(toUInt32OrZero(LogAttributes['num_non_blocking_error'])) AS errors, sum(toUInt32OrZero(LogAttributes['num_blocking'])) AS blocked, sum(toUInt32OrZero(LogAttributes['num_cancelled'])) AS cancelled, quantile(0.5)(toFloat64OrZero(LogAttributes['total_duration_ms'])) AS p50_ms, quantile(0.95)(toFloat64OrZero(LogAttributes['total_duration_ms'])) AS p95_ms, sum(toFloat64OrZero(LogAttributes['total_duration_ms'])) / 1000 AS total_time FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'hook_execution_complete' AND $__timeFilter(Timestamp) GROUP BY hook ORDER BY total_time DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "One row per hook event and matcher. Claude Code doesn't report which hook command ran; see Configured hooks for where they come from."
+    },
+    {
+      "id": 25,
+      "type": "table",
+      "title": "Configured hooks",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 74,
+        "w": 10,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT LogAttributes['hook_event'] AS event, LogAttributes['hook_matcher'] AS matcher, LogAttributes['hook_source'] AS source, LogAttributes['plugin.name'] AS plugin, max(Timestamp) AS last_seen FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'hook_registered' AND $__timeFilter(Timestamp) GROUP BY event, matcher, source, plugin ORDER BY event, source, plugin",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Hook time",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 83,
+        "w": 24,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(Timestamp) AS time, LogAttributes['hook_event'] AS hook_event, sum(toFloat64OrZero(LogAttributes['total_duration_ms'])) / 1000 AS seconds FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'hook_execution_complete' AND $__timeFilter(Timestamp) GROUP BY time, hook_event ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "interval": "1h",
+      "maxDataPoints": 60
     }
   ]
 }

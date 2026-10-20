@@ -7,10 +7,10 @@ services:
       CLICKHOUSE_DB: otel
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-otel}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-otel}
-    ports:
-      - 127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123
+      GRAFANA_CLICKHOUSE_PASSWORD: ${GRAFANA_CLICKHOUSE_PASSWORD:-grafana}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/users.d/grafana.xml:/etc/clickhouse-server/users.d/grafana.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -41,11 +41,12 @@ services:
   grafana:
     image: grafana/grafana:13.2.2
     environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-otel}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-otel}
+      GRAFANA_CLICKHOUSE_PASSWORD: ${GRAFANA_CLICKHOUSE_PASSWORD:-grafana}
       GF_PLUGINS_PREINSTALL: grafana-clickhouse-datasource@4.21.3
+      GF_SERVER_DOMAIN: localhost
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3000}/
+      GF_SERVER_ENFORCE_DOMAIN: "true"
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/claude-code.json
       GF_ANALYTICS_REPORTING_ENABLED: "false"

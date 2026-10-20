@@ -10,7 +10,7 @@ datasources:
       host: clickhouse
       port: 9000
       protocol: native
-      username: $CLICKHOUSE_USER
+      username: grafana
       defaultDatabase: otel
       logs:
         defaultDatabase: otel
@@ -21,4 +21,4 @@ datasources:
         defaultTable: otel_traces
         otelEnabled: true
     secureJsonData:
-      password: $CLICKHOUSE_PASSWORD
+      password: $GRAFANA_CLICKHOUSE_PASSWORD

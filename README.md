@@ -24,7 +24,7 @@ Requires Docker with the `docker compose` plugin.
 docker compose up -d
 ```
 
-Open <http://localhost:3000>. There is no login, because every port is bound to `127.0.0.1`.
+Open <http://localhost:3000>. There is no login: Grafana listens on `127.0.0.1` only, and visitors get read-only access.
 
 ## Point Claude Code at it
 
@@ -37,11 +37,12 @@ jq -s '.[0] * .[1]' ~/.claude/settings.json claude-code/settings.json > /tmp/cla
 
 Then start a new Claude Code session. Claude Code reads these settings at startup, so sessions that are already running don't report. Metrics arrive every 60 seconds and events every 5 seconds.
 
-## Privacy
+## Privacy and security
 
 - **Nothing leaves your machine.** Claude Code sends telemetry only to the endpoint you configure, here the local collector.
 - **Prompts and responses are not recorded.** Claude Code redacts them by default; only their length is kept.
 - **Your email and account IDs are recorded** as attributes on every data point, as Claude Code sends them.
+- **Other websites can't reach the data.** ClickHouse isn't published on the host at all. Grafana only answers requests addressed to `localhost`, which blocks DNS rebinding, and it reads ClickHouse as a `grafana` user that can only `SELECT` from the `otel` database.
 
 These optional settings add more detail. Add them to the same `env` block if you want them:
 
@@ -58,7 +59,11 @@ Cost is what the tokens would cost at API list prices. On a Pro, Max, Team or En
 
 ## Querying the data directly
 
-ClickHouse's SQL console is at <http://localhost:8123/play> (user `otel`, password `otel`).
+Open a ClickHouse SQL shell with:
+
+```bash
+docker compose exec clickhouse clickhouse-client --user otel --password otel
+```
 
 - **`otel.otel_metrics_sum`** holds the metrics. Claude Code sends deltas, so `sum(Value)` over any time range is the total for that range.
 - **`otel.otel_logs`** holds the events. The event name is in `LogAttributes['event.name']`.
@@ -71,6 +76,8 @@ GROUP BY day, model
 ORDER BY day DESC, cost_usd DESC
 ```
 
+To connect a desktop SQL client, publish port `8123` in a `compose.override.yaml` and set a strong `CLICKHOUSE_PASSWORD` first. Any website you open can send requests to ports on `localhost`, and the default password is public.
+
 ## Configuration
 
 To change credentials or ports, set these in a `.env` file next to `docker-compose.yml`:
@@ -79,10 +86,12 @@ To change credentials or ports, set these in a `.env` file next to `docker-compo
 | --- | --- |
 | `CLICKHOUSE_USER` | `otel` |
 | `CLICKHOUSE_PASSWORD` | `otel` |
+| `GRAFANA_CLICKHOUSE_PASSWORD` | `grafana` |
 | `GRAFANA_PORT` | `3000` |
-| `CLICKHOUSE_HTTP_PORT` | `8123` |
 | `OTLP_GRPC_PORT` | `4317` |
 | `OTLP_HTTP_PORT` | `4318` |
+
+The collector writes to ClickHouse as `CLICKHOUSE_USER`. Grafana reads as the `grafana` user.
 
 If you change `OTLP_GRPC_PORT`, change the port in `OTEL_EXPORTER_OTLP_ENDPOINT` too. Data is kept for one year (`ttl` in [`collector/config.yaml`](collector/config.yaml)).
 

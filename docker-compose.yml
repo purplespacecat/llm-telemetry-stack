@@ -48,7 +48,7 @@ services:
       GF_SERVER_ENFORCE_DOMAIN: "true"
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/claude-code.json
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/cost.json
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"

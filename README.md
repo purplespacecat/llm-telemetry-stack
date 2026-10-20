@@ -1,6 +1,6 @@
 # llm-telemetry-stack
 
-A local Grafana dashboard for your Claude Code usage: cost, tokens, sessions, tools and errors. Everything runs on your machine.
+Local Grafana dashboards for your Claude Code usage: what it costs, how you use it and what fails. Everything runs on your machine.
 
 ```text
 Claude Code ──OTLP──> OpenTelemetry Collector ──> ClickHouse ──> Grafana
@@ -27,19 +27,13 @@ You need Docker with the `docker compose` plugin.
 
 3. Start a new Claude Code session and open <http://localhost:3000>. Data appears within a minute.
 
-## Dashboard
+## Dashboards
 
-**Claude Code usage** opens as the home page, with no login.
+There are three dashboards, linked from each other's header. **Claude Code cost** opens as the home page, with no login.
 
-- **Totals:** cost, tokens, cache hit ratio, sessions, active time, lines of code
-- **Over time:** cost by model, tokens by type
-- **Breakdowns:** cost by repository, cost by source (main loop, subagents, skills, MCP servers), top sessions
-- **Tools:** calls, failure rate and latency per tool, failed calls by error type, permission decisions
-- **API:** failed calls with status and message, errors over time, latency
-- **Git:** commits and pull requests made by Claude Code
-- **Skills:** activations over time, whether you or Claude triggered each skill, and sessions with no skills by repository
-- **MCP:** calls, failure rate and latency per server and tool, connection failures with their errors
-- **Hooks:** runs, errors and duration per hook, configured hooks and where they come from, hook time over time
+- **Claude Code cost:** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, source (main loop, subagents, skills, MCP servers) and session
+- **Claude Code efficiency:** active time, lines of code, commits and pull requests; which skills ran, whether you or Claude triggered them, and sessions with no skills; tool latency and permission prompts; MCP servers used; hook time and configured hooks
+- **Claude Code reliability:** API errors, error rate, retries and latency; failed tool calls by tool and error type; MCP connection failures; hook errors
 
 Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
 

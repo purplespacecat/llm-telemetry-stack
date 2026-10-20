@@ -37,6 +37,7 @@ You need Docker with the `docker compose` plugin.
 - **Tools:** calls, failure rate and latency per tool, permission decisions
 - **API:** errors by status code, latency
 - **Git:** commits and pull requests made by Claude Code
+- **Skills:** activations over time, whether you or Claude triggered each skill, and sessions with no skills by repository
 
 Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
 
@@ -44,7 +45,8 @@ Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn'
 
 - Data stays on your machine. Grafana listens on `127.0.0.1` only, and ClickHouse isn't exposed outside Docker.
 - Prompts and responses aren't recorded. Your email and account ID are.
-- To record more, add `OTEL_LOG_TOOL_DETAILS=1` (tool and MCP names, Bash commands, file paths) or `OTEL_LOG_USER_PROMPTS=1` (prompt and response text) to the same `env` block.
+- Skill, agent and MCP names are recorded. The setting that enables them (`OTEL_LOG_TOOL_DETAILS`) also sends Bash commands, file paths and tool arguments; the collector drops those before they're stored.
+- To record prompt and response text, add `OTEL_LOG_USER_PROMPTS=1` to the same `env` block.
 
 ## Stop
 
@@ -88,4 +90,4 @@ ORDER BY day DESC
 
 - **No data:** settings only apply to new sessions. Wait a minute, then check `docker compose logs otel-collector`.
 - **Docker installed as a snap (Ubuntu):** keep the repo outside hidden folders and `/tmp`, or the config files mount as empty folders.
-- **Organisation-managed settings:** a managed `OTEL_EXPORTER_OTLP_ENDPOINT` replaces yours.
+- **Organisation-managed settings:** a managed `OTEL_EXPORTER_OTLP_ENDPOINT` replaces yours, and Bash commands and file paths then go to that collector unfiltered. Remove `OTEL_LOG_TOOL_DETAILS` if that matters to you.

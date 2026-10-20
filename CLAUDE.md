@@ -9,6 +9,13 @@ Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse an
 - Claude Code exports metrics with delta temporality (`AggregationTemporality = 1` in `otel.otel_metrics_sum`), so `sum(Value)` per bucket is the usage in that bucket. Don't use `max` or rate functions.
 - Event names live in `LogAttributes['event.name']`. The exporter's `EventName` column stays empty for Claude Code events (collector 0.161.0, Claude Code 2.1.303).
 - Standard attributes (`session.id`, `user.*`, `vcs.*`) sit in each row's `Attributes` / `LogAttributes` map, not in `ResourceAttributes`.
+- `skill_activated` events carry `skill.name`, `skill.source` and `invocation_trigger` (`user-slash`, `claude-proactive`, `nested-skill`). Cost and token counters carry `skill.name` for the skill active during the request.
+
+## Tool details filter
+
+- The snippet sets `OTEL_LOG_TOOL_DETAILS=1` so skill, agent and MCP names arrive unredacted. Without it, user-defined skills show as `custom_skill`.
+- The same flag adds Bash commands, file paths and arguments. `transform/drop-tool-arguments` in `collector/config.yaml` deletes `tool_parameters`, `tool_input` and `tool_result`'s `error` before export. It covers logs only; the snippet doesn't export traces, whose spans would carry `file_path` and `full_command`.
+- Verify after changing the filter: run the test session below with `OTEL_LOG_TOOL_DETAILS=1` and a Bash `echo` of a unique string, then confirm the string appears nowhere in `otel.otel_logs` (`Body` or `mapValues(LogAttributes)`).
 
 ## Access
 

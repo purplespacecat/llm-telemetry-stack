@@ -841,6 +841,150 @@
       },
       "interval": "1h",
       "maxDataPoints": 60
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Skill activations",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(Timestamp) AS time, LogAttributes['skill.name'] AS skill, count() AS activations FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'skill_activated' AND $__timeFilter(Timestamp) GROUP BY time, skill ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Skills you write yourself show as custom_skill unless OTEL_LOG_TOOL_DETAILS=1.",
+      "interval": "1h",
+      "maxDataPoints": 60
+    },
+    {
+      "id": 18,
+      "type": "table",
+      "title": "Skills",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 14,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT LogAttributes['skill.name'] AS skill, any(LogAttributes['skill.source']) AS source, count() AS activations, countIf(LogAttributes['invocation_trigger'] = 'user-slash') AS by_you, countIf(LogAttributes['invocation_trigger'] = 'claude-proactive') AS by_claude, countIf(LogAttributes['invocation_trigger'] = 'nested-skill') AS nested, max(Timestamp) AS last_used FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'skill_activated' AND $__timeFilter(Timestamp) GROUP BY skill ORDER BY activations DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "by_you: you typed the / command. by_claude: Claude picked the skill itself. A skill you often type but Claude never picks may need a clearer description."
+    },
+    {
+      "id": 19,
+      "type": "table",
+      "title": "Sessions without skills",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 47,
+        "w": 10,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "WITH skilled AS (SELECT DISTINCT LogAttributes['session.id'] FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'skill_activated' AND $__timeFilter(Timestamp)) SELECT if(repository = '', '(not recorded)', repository) AS repository, count() AS sessions, countIf(session NOT IN skilled) AS without_skills, sumIf(cost_usd, session NOT IN skilled) AS cost_without_skills FROM (SELECT Attributes['session.id'] AS session, any(Attributes['vcs.repository.name']) AS repository, sum(Value) AS cost_usd FROM otel.otel_metrics_sum WHERE MetricName = 'claude_code.cost.usage' AND $__timeFilter(TimeUnix) GROUP BY session) GROUP BY repository ORDER BY without_skills DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_without_skills"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "Sessions where no skill ran, by repository: places to look for skills you could have used."
     }
   ]
 }

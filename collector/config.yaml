@@ -6,6 +6,14 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 
+processors:
+  transform/drop-tool-arguments:
+    error_mode: ignore
+    log_statements:
+      - delete_key(log.attributes, "tool_parameters")
+      - delete_key(log.attributes, "tool_input")
+      - delete_key(log.attributes, "error") where log.attributes["event.name"] == "tool_result"
+
 exporters:
   clickhouse:
     endpoint: tcp://clickhouse:9000?dial_timeout=10s
@@ -23,6 +31,7 @@ service:
       exporters: [clickhouse]
     logs:
       receivers: [otlp]
+      processors: [transform/drop-tool-arguments]
       exporters: [clickhouse]
     traces:
       receivers: [otlp]

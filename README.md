@@ -1,82 +1,59 @@
 # llm-telemetry-stack
 
-A local stack for watching your own Claude Code usage: cost, tokens, sessions, tools and errors, on a Grafana dashboard. Everything runs on your machine.
+A local Grafana dashboard for your Claude Code usage: cost, tokens, sessions, tools and errors. Everything runs on your machine.
 
 ```text
 Claude Code ──OTLP──> OpenTelemetry Collector ──> ClickHouse ──> Grafana
 ```
 
-## What you get
+## Set up
 
-The **Claude Code usage** dashboard shows:
+You need Docker with the `docker compose` plugin.
 
-- Cost, tokens, cache hit ratio, sessions, active time and lines of code for the selected range
-- Cost by model and tokens by type over time
-- Cost by repository, by source (main loop, subagents, skills, MCP servers) and the most expensive sessions
-- Tool calls with failure rate and latency, permission decisions, API errors and API latency
-- Commits and pull requests made through Claude Code
+1. Start the stack:
 
-## Quick start
+   ```bash
+   docker compose up -d
+   ```
 
-Requires Docker with the `docker compose` plugin.
+2. Turn on telemetry by merging [`claude-code/settings.json`](claude-code/settings.json) into `~/.claude/settings.json`:
 
-```bash
-docker compose up -d
-```
+   ```bash
+   jq -s '.[0] * .[1]' ~/.claude/settings.json claude-code/settings.json > /tmp/claude-settings.json \
+     && mv /tmp/claude-settings.json ~/.claude/settings.json
+   ```
 
-Open <http://localhost:3000>. There is no login: Grafana listens on `127.0.0.1` only, and visitors get read-only access.
+   If you don't have `~/.claude/settings.json` yet, copy the file instead.
 
-## Point Claude Code at it
+3. Start a new Claude Code session and open <http://localhost:3000>. Data appears within a minute.
 
-Merge the `env` block from [`claude-code/settings.json`](claude-code/settings.json) into `~/.claude/settings.json`. With `jq`, when the file already exists:
+## Dashboard
 
-```bash
-jq -s '.[0] * .[1]' ~/.claude/settings.json claude-code/settings.json > /tmp/claude-settings.json \
-  && mv /tmp/claude-settings.json ~/.claude/settings.json
-```
+**Claude Code usage** opens as the home page, with no login.
 
-Then start a new Claude Code session. Claude Code reads these settings at startup, so sessions that are already running don't report. Metrics arrive every 60 seconds and events every 5 seconds.
+- **Totals:** cost, tokens, cache hit ratio, sessions, active time, lines of code
+- **Over time:** cost by model, tokens by type
+- **Breakdowns:** cost by repository, cost by source (main loop, subagents, skills, MCP servers), top sessions
+- **Tools:** calls, failure rate and latency per tool, permission decisions
+- **API:** errors by status code, latency
+- **Git:** commits and pull requests made by Claude Code
 
-## Privacy and security
+Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
 
-- **Nothing leaves your machine.** Claude Code sends telemetry only to the endpoint you configure, here the local collector.
-- **Prompts and responses are not recorded.** Claude Code redacts them by default; only their length is kept.
-- **Your email and account IDs are recorded** as attributes on every data point, as Claude Code sends them.
-- **Other websites can't reach the data.** ClickHouse isn't published on the host at all. Grafana only answers requests addressed to `localhost`, which blocks DNS rebinding, and it reads ClickHouse as a `grafana` user that can only `SELECT` from the `otel` database.
+## Privacy
 
-These optional settings add more detail. Add them to the same `env` block if you want them:
+- Data stays on your machine. Grafana listens on `127.0.0.1` only, and ClickHouse isn't exposed outside Docker.
+- Prompts and responses aren't recorded. Your email and account ID are.
+- To record more, add `OTEL_LOG_TOOL_DETAILS=1` (tool and MCP names, Bash commands, file paths) or `OTEL_LOG_USER_PROMPTS=1` (prompt and response text) to the same `env` block.
 
-| Setting | Adds |
-| --- | --- |
-| `OTEL_LOG_TOOL_DETAILS=1` | Real names for custom skills, agents and MCP tools, plus Bash commands and file paths |
-| `OTEL_LOG_USER_PROMPTS=1` | Prompt text, and response text unless `OTEL_LOG_ASSISTANT_RESPONSES=0` |
-
-The full list of what Claude Code exports is in the [monitoring docs](https://code.claude.com/docs/en/monitoring-usage).
-
-## About the cost figures
-
-Cost is what the tokens would cost at API list prices. On a Pro, Max, Team or Enterprise subscription it is not a bill, but it is still useful for comparing models, repositories and days. Check your plan limits with `/usage` in Claude Code.
-
-## Querying the data directly
-
-Open a ClickHouse SQL shell with:
+## Stop
 
 ```bash
-docker compose exec clickhouse clickhouse-client --user otel --password otel
+docker compose down     # stop, keep the data
+docker compose down -v  # stop and delete all data
 ```
 
-- **`otel.otel_metrics_sum`** holds the metrics. Claude Code sends deltas, so `sum(Value)` over any time range is the total for that range.
-- **`otel.otel_logs`** holds the events. The event name is in `LogAttributes['event.name']`.
-
-```sql
-SELECT toDate(TimeUnix) AS day, Attributes['model'] AS model, round(sum(Value), 2) AS cost_usd
-FROM otel.otel_metrics_sum
-WHERE MetricName = 'claude_code.cost.usage'
-GROUP BY day, model
-ORDER BY day DESC, cost_usd DESC
-```
-
-To connect a desktop SQL client, publish port `8123` in a `compose.override.yaml` and set a strong `CLICKHOUSE_PASSWORD` first. Any website you open can send requests to ports on `localhost`, and the default password is public.
+Data is kept for one year.
 
 ## Configuration
 
@@ -84,27 +61,31 @@ To change credentials or ports, set these in a `.env` file next to `docker-compo
 
 | Variable | Default |
 | --- | --- |
-| `CLICKHOUSE_USER` | `otel` |
-| `CLICKHOUSE_PASSWORD` | `otel` |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `otel` / `otel` |
 | `GRAFANA_CLICKHOUSE_PASSWORD` | `grafana` |
 | `GRAFANA_PORT` | `3000` |
-| `OTLP_GRPC_PORT` | `4317` |
-| `OTLP_HTTP_PORT` | `4318` |
+| `OTLP_GRPC_PORT` / `OTLP_HTTP_PORT` | `4317` / `4318` |
 
-The collector writes to ClickHouse as `CLICKHOUSE_USER`. Grafana reads as the `grafana` user.
+If you change `OTLP_GRPC_PORT`, change the port in `OTEL_EXPORTER_OTLP_ENDPOINT` in your Claude Code settings too.
 
-If you change `OTLP_GRPC_PORT`, change the port in `OTEL_EXPORTER_OTLP_ENDPOINT` too. Data is kept for one year (`ttl` in [`collector/config.yaml`](collector/config.yaml)).
-
-## Stopping and removing
+## Query with SQL
 
 ```bash
-docker compose down     # stop, keep the data
-docker compose down -v  # stop and delete all data
+docker compose exec clickhouse clickhouse-client --user otel --password otel
+```
+
+Metrics are in `otel.otel_metrics_sum`, where `sum(Value)` gives the total for any range. Events are in `otel.otel_logs`, named by `LogAttributes['event.name']`.
+
+```sql
+SELECT toDate(TimeUnix) AS day, round(sum(Value), 2) AS cost_usd
+FROM otel.otel_metrics_sum
+WHERE MetricName = 'claude_code.cost.usage'
+GROUP BY day
+ORDER BY day DESC
 ```
 
 ## Troubleshooting
 
-- **No data on the dashboard:** start a new Claude Code session after changing the settings, wait a minute, then check `docker compose logs otel-collector`.
-- **Docker installed as a snap (Ubuntu):** keep this repo outside hidden folders and `/tmp`. Snap Docker cannot see them, so the config files mount as empty folders.
-- **A port is already in use:** set a different one in `.env`.
-- **Managed settings:** if your organisation sets `OTEL_EXPORTER_OTLP_ENDPOINT` in Claude Code managed settings, it replaces your local endpoint.
+- **No data:** settings only apply to new sessions. Wait a minute, then check `docker compose logs otel-collector`.
+- **Docker installed as a snap (Ubuntu):** keep the repo outside hidden folders and `/tmp`, or the config files mount as empty folders.
+- **Organisation-managed settings:** a managed `OTEL_EXPORTER_OTLP_ENDPOINT` replaces yours.

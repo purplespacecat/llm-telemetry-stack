@@ -2,6 +2,8 @@
 
 Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse and shows it in Grafana. Public repo: keep it generic, with no employer-specific names, endpoints or settings.
 
+`README.md` is for users: setup, running, what the dashboard shows. Keep it short; internals and gotchas go here.
+
 ## Data shape
 
 - Claude Code exports metrics with delta temporality (`AggregationTemporality = 1` in `otel.otel_metrics_sum`), so `sum(Value)` per bucket is the usage in that bucket. Don't use `max` or rate functions.
@@ -11,7 +13,8 @@ Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse an
 ## Access
 
 - Grafana queries ClickHouse as `grafana`, defined in `clickhouse/users.d/grafana.xml` with only `SELECT ON otel.*`. A panel reading anything outside `otel` fails with `ACCESS_DENIED`.
-- ClickHouse has no host port. Run SQL through `docker compose exec clickhouse clickhouse-client`.
+- ClickHouse has no host port. Run SQL through `docker compose exec clickhouse clickhouse-client`. Don't publish `8123` or `9000` with the default passwords: any website can send requests to `localhost`, and `otel` can write data out with `INSERT INTO FUNCTION url(...)`.
+- `GF_SERVER_ENFORCE_DOMAIN` redirects any host other than `localhost` to `GF_SERVER_ROOT_URL`, which blocks DNS rebinding. Opening `127.0.0.1:3000` redirects to `localhost:3000`.
 - Grafana 13 ignores `GF_AUTH_ANONYMOUS_ORG_ROLE` and logs "only viewer role is supported", so anonymous visitors are always Viewers.
 
 ## Changing the dashboard

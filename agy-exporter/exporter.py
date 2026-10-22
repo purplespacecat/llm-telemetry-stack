@@ -46,6 +46,9 @@ Reverse-engineered protobuf schema notes (Antigravity / Cortex SQLite store):
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import http.client
 import json
 import os
 import re
@@ -65,9 +68,13 @@ GEMINI_DIR = Path(os.environ.get("GEMINI_DIR", "/gemini"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/state/state.json"))
 OTLP_HTTP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318").rstrip("/")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "5"))
-IN_FLIGHT_STEP_GRACE_SEC = 120.0
+# A step still in flight is exported as abandoned only after its conversation has gone this long
+# without a write. A running tool call or subagent does not write to its parent's database, so this
+# must outlast the longest one you expect.
+ABANDON_IDLE_SEC = float(os.environ.get("ABANDON_IDLE_SEC", str(6 * 3600)))
 MAX_BATCH_BYTES = 4 * 1024 * 1024
-SINGLE_CONV_SPLIT_BYTES = 450 * 1024
+# A connection dropped while sending a body this large is taken as the collector refusing its size.
+CONNECTION_DROP_SPLIT_BYTES = 256 * 1024
 
 # API list prices in USD per 1M tokens: (input_per_1m, cache_read_per_1m, output_per_1m)
 MODEL_PRICING: list[tuple[str, tuple[float, float, float]]] = [
@@ -359,12 +366,27 @@ def make_log_record(ts_ns: int, event_name: str, attrs: dict[str, Any], body: st
     }
 
 
-def post_otlp(path: str, payload: dict[str, Any]) -> tuple[bool, bool]:
-    """Send OTLP/HTTP JSON payload and return (ok, retryable).
+_LAST_POST_ERROR_LOG: dict[tuple[str, str], float] = {}
 
-    Per the OTLP spec, HTTP 2xx with `partialSuccess` means the collector accepted
-    the valid portion of the batch and the client MUST NOT retry it; we log the
-    rejected counts and return (True, False) so cursors advance.
+
+def _log_post_error(path: str, kind: str, message: str) -> None:
+    """Print a POST failure at most once a minute per (path, kind), so a dead endpoint doesn't flood the log."""
+    now = time.monotonic()
+    if now - _LAST_POST_ERROR_LOG.get((path, kind), float("-inf")) >= 60:
+        _LAST_POST_ERROR_LOG[(path, kind)] = now
+        print(f"[agy-exporter] {message}", flush=True)
+
+
+def post_otlp(path: str, payload: dict[str, Any]) -> str:
+    """Send an OTLP/HTTP JSON payload and classify the outcome.
+
+    Returns "ok"; "retry" (keep the data and try again next poll); "bad_request"
+    (HTTP 400: this payload will never be accepted); or "too_large" (HTTP 413, or the
+    connection dropped while sending a large body: split it and send the halves).
+    Only a 400 says anything about the data. Auth, routing and availability errors
+    (401, 403, 404, 408, 429, 5xx) are "retry", so a misconfigured endpoint never causes
+    data to be discarded. Per the OTLP spec, 2xx with `partialSuccess` means the
+    collector kept the rest of the batch and the client must not retry it, so it is "ok".
     """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -376,9 +398,6 @@ def post_otlp(path: str, payload: dict[str, Any]) -> tuple[bool, bool]:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw_body = resp.read()
-            if not (200 <= resp.status < 300):
-                retryable = resp.status in (429, 500, 502, 503, 504)
-                return False, retryable
             if raw_body:
                 try:
                     body_json = json.loads(raw_body.decode("utf-8", errors="replace"))
@@ -397,22 +416,22 @@ def post_otlp(path: str, payload: dict[str, Any]) -> tuple[bool, bool]:
                                 )
                 except Exception as parse_exc:
                     print(f"[agy-exporter] Malformed OTLP 2xx response on {path}: {parse_exc}", flush=True)
-            return True, False
+            return "ok"
     except urllib.error.HTTPError as exc:
         err_body = ""
         try:
             err_body = exc.read().decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
-        retryable = exc.code in (429, 500, 502, 503, 504)
-        print(
-            f"[agy-exporter] HTTP {exc.code} POST {path} (retryable={retryable}): {err_body or exc.reason}",
-            flush=True,
-        )
-        return False, retryable
+        kind = {400: "bad_request", 413: "too_large"}.get(exc.code, "retry")
+        _log_post_error(path, f"http-{exc.code}", f"HTTP {exc.code} POST {path} ({kind}): {err_body or exc.reason}")
+        return kind
     except Exception as exc:
-        print(f"[agy-exporter] Failed POST {path}: {exc}", flush=True)
-        return False, True
+        reason = getattr(exc, "reason", exc)  # URLError wraps the socket error raised while sending
+        dropped = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, http.client.RemoteDisconnected)
+        kind = "too_large" if isinstance(reason, dropped) and len(data) > CONNECTION_DROP_SPLIT_BYTES else "retry"
+        _log_post_error(path, type(reason).__name__, f"Failed POST {path} ({kind}, {len(data)} bytes): {exc}")
+        return kind
 
 
 def snapshot_sqlite_to_memory(db_path: Path, tmp_dir: Path) -> sqlite3.Connection:
@@ -565,7 +584,8 @@ def process_conversation_db(
 ]:
     """Extract new generation and step telemetry for a single conversation."""
     cid = db_path.stem
-    has_live_wal = Path(str(db_path) + "-wal").exists()
+    wal_file = Path(str(db_path) + "-wal")
+    conv_mtime_ns = max(db_path.stat().st_mtime_ns, wal_file.stat().st_mtime_ns if wal_file.exists() else 0)
     gen_metrics: dict[str, list[dict[str, Any]]] = {}
     step_metrics: dict[str, list[dict[str, Any]]] = {}
     gen_logs: list[dict[str, Any]] = []
@@ -584,10 +604,15 @@ def process_conversation_db(
         repo = summary_info.get("repository", "")
         branch = ""
         traj_created_ns = 0
+        own_agent_name = ""
         row = conn.execute("SELECT data FROM trajectory_metadata_blob LIMIT 1").fetchone()
         if row and row[0]:
             tm = parse_wire(row[0])
             traj_created_ns = proto_ts_ns(wire_msg(tm, 2))
+            # A subagent's trajectory carries its agent definition (field 4) and invocation (field 8),
+            # both with the agent name at field 1. Read here, it is visible as soon as the conversation
+            # exists, unlike conversation_summaries.db, whose new rows can sit in an unmounted -wal.
+            own_agent_name = wire_str(wire_msg(tm, 4), 1) or wire_str(wire_msg(tm, 8), 1)
             ws_info = wire_msg(tm, 1)
             git_info = wire_msg(ws_info, 3)
             git_repo = wire_str(git_info, 1)
@@ -608,7 +633,7 @@ def process_conversation_db(
 
         nesting_depth = int(summary_info.get("nesting_depth", 0) or (1 if has_parent else 0))
         query_source = "subagent" if nesting_depth > 0 else "main"
-        agent_name = str(summary_info.get("agent_name", ""))
+        agent_name = own_agent_name or str(summary_info.get("agent_name", ""))
 
         base_attrs = {
             "session.id": cid,
@@ -758,21 +783,10 @@ def process_conversation_db(
             )
 
         now_ns = int(time.time() * 1e9)
-        first_ts = step_ts_map.get(0) or step_ts_map.get(1) or traj_created_ns or now_ns
-
-        # If a brand-new conversation (< IN_FLIGHT_STEP_GRACE_SEC old) has no row in conversation_summaries.db yet
-        # (first poll raced summary creation), treat it as in-flight and wait one poll before emitting session.count
-        # so agent.name / nesting_depth are not permanently blanked.
-        if (
-            has_live_wal
-            and not conv_state.get("session_counted")
-            and not summary_info
-            and (surface_dir / "conversation_summaries.db").exists()
-            and (now_ns - first_ts) / 1e9 < IN_FLIGHT_STEP_GRACE_SEC
-            and not conv_state.get("summary_grace_waited")
-        ):
-            conv_state["summary_grace_waited"] = True
-            return gen_metrics, step_metrics, [], conv_state, True
+        first_ts = step_ts_map.get(0) or step_ts_map.get(1) or traj_created_ns or conv_mtime_ns
+        # Only a conversation that has stopped being written to can have abandoned steps. A step's age
+        # says nothing: a five-minute build in a live session is still running.
+        session_idle = (now_ns - conv_mtime_ns) / 1e9 >= ABANDON_IDLE_SEC
 
         # Emit session count once per conversation
         if not conv_state.get("session_counted"):
@@ -797,20 +811,17 @@ def process_conversation_db(
             step_indices = parse_packed_varints(wire_bytes(f, 2))
             first_step_idx: int | None = step_indices[0] if step_indices else None
 
-            # Non-blocking in-flight generation check: only defer if the planner step is actively in-flight
-            # within the grace window; never `break` or block later generations behind an abandoned step.
-            if has_live_wal and first_step_idx is not None and step_status_map.get(first_step_idx) in (0, 1, 2):
-                ref_gen_ts = step_ts_map.get(first_step_idx) or max(step_ts_map.values(), default=0) or traj_created_ns or now_ns
-                step_age = (now_ns - ref_gen_ts) / 1e9
-                if step_age < IN_FLIGHT_STEP_GRACE_SEC:
-                    has_in_flight = True
-                    if need_gen_metric:
-                        new_pending_metric_gens.add(g_idx)
-                    if need_gen_log:
-                        new_pending_log_gens.add(g_idx)
-                    last_metric_gen_idx = max(last_metric_gen_idx, g_idx)
-                    last_log_gen_idx = max(last_log_gen_idx, g_idx)
-                    continue
+            # Defer a generation whose planner step is still streaming, so its usage is read once complete.
+            # Never `break`: later generations must not wait behind this one.
+            if first_step_idx is not None and step_status_map.get(first_step_idx) in (0, 1, 2) and not session_idle:
+                has_in_flight = True
+                if need_gen_metric:
+                    new_pending_metric_gens.add(g_idx)
+                if need_gen_log:
+                    new_pending_log_gens.add(g_idx)
+                last_metric_gen_idx = max(last_metric_gen_idx, g_idx)
+                last_log_gen_idx = max(last_log_gen_idx, g_idx)
+                continue
 
             for gm in wire_msg_list(f, 1):
                 kv = {wire_str(x, 1): wire_str(x, 2) for x in wire_msg_list(gm, 20)}
@@ -845,7 +856,7 @@ def process_conversation_db(
                 dur_ms = proto_duration_ms(wire_msg(gm, 11))
                 ttft_ms = proto_duration_ms(wire_msg(gm, 12))
 
-                ts_ns = step_ts_map.get(resolved_step_idx) or traj_created_ns or now_ns
+                ts_ns = step_ts_map.get(resolved_step_idx) or traj_created_ns or conv_mtime_ns
                 skill_for_turn = active_skill_by_step.get(resolved_step_idx, "")
                 mcp_for_turn = ""
                 for s_i in step_indices:
@@ -906,7 +917,6 @@ def process_conversation_db(
 
         last_known_model = "auto"
         last_known_query_source = query_source
-        last_step_ts = traj_created_ns
         for idx, stype, status, m, perm_blob, err_blob, tname, args_dict, t_content, err_msg, success, exit_code, activated_skill in parsed_steps:
             step_model = model_by_step.get(idx, last_known_model)
             if step_model and step_model != "auto":
@@ -921,8 +931,6 @@ def process_conversation_db(
             step_attrs = {**base_attrs, "query_source": step_query_source}
 
             t_created = proto_ts_ns(wire_msg(m, 1))
-            if t_created > 0:
-                last_step_ts = t_created
 
             need_step_metric = (idx > last_metric_step_idx) or (idx in pending_metric_steps)
             need_step_log = (idx > last_log_step_idx) or (idx in pending_log_steps)
@@ -932,20 +940,17 @@ def process_conversation_db(
             t_started = proto_ts_ns(wire_msg(m, 6)) or t_created
             t_completed = proto_ts_ns(wire_msg(m, 8)) or t_started
 
-            # Non-blocking in-flight step check: only keep in pending_*_steps while within grace window.
-            # Once past IN_FLIGHT_STEP_GRACE_SEC (or when no live WAL exists), fall through and emit as abandoned.
-            if status in (0, 1, 2, 9):
-                ref_step_ts = t_created or last_step_ts or traj_created_ns or now_ns
-                age_sec = (now_ns - ref_step_ts) / 1e9
-                if has_live_wal and age_sec < IN_FLIGHT_STEP_GRACE_SEC:
-                    has_in_flight = True
-                    if need_step_metric:
-                        new_pending_metric_steps.add(idx)
-                    if need_step_log:
-                        new_pending_log_steps.add(idx)
-                    last_metric_step_idx = max(last_metric_step_idx, idx)
-                    last_log_step_idx = max(last_log_step_idx, idx)
-                    continue
+            # Keep an in-flight step pending until it finishes, or until its conversation has been idle for
+            # ABANDON_IDLE_SEC; only then does it fall through and get exported as abandoned.
+            if status in (0, 1, 2, 9) and not session_idle:
+                has_in_flight = True
+                if need_step_metric:
+                    new_pending_metric_steps.add(idx)
+                if need_step_log:
+                    new_pending_log_steps.add(idx)
+                last_metric_step_idx = max(last_metric_step_idx, idx)
+                last_log_step_idx = max(last_log_step_idx, idx)
+                continue
 
             # Check status transitions in field 26: status=9 is waiting on user permission,
             # and the last status=2 is when tool execution actually began after approval.
@@ -964,7 +969,7 @@ def process_conversation_db(
                     elif st_code in (3, 6, 7):
                         t_completed = st_ts
 
-            ts_ns = t_created or traj_created_ns or now_ns
+            ts_ns = t_created or traj_created_ns or conv_mtime_ns
             # Guard against zero t_exec_start producing a ~56-year duration when only t_completed is set
             if t_exec_start > 0 and t_completed >= t_exec_start:
                 dur_ms = (t_completed - t_exec_start) / 1_000_000.0
@@ -1014,7 +1019,11 @@ def process_conversation_db(
                     accepted_flag = wire_int(p_item, 2, 0) == 1
                     rule_type = wire_int(p_item, 3, 0)
                     scope = wire_str(p_item, 5) or "tool"
-                    if "user denied permission" in err_msg.lower():
+                    if status == 9:
+                        # Still waiting for an answer when the session went idle: nobody decided.
+                        decision = "unanswered"
+                        perm_source = "user"
+                    elif "user denied permission" in err_msg.lower():
                         decision = "reject"
                         perm_source = "user"
                     elif not accepted_flag and status == 7:
@@ -1024,7 +1033,7 @@ def process_conversation_db(
                         decision = "accept"
                         perm_source = "config" if rule_type > 0 else "user_prompt"
 
-                    if perm_source.startswith("user"):
+                    if perm_source.startswith("user") and decision != "unanswered":
                         user_prompted_in_step = True
 
                     scopes.append(scope)
@@ -1032,7 +1041,7 @@ def process_conversation_db(
                     sources.append(perm_source)
 
                 if scopes:
-                    step_decision = "reject" if "reject" in decisions else "accept"
+                    step_decision = next((d for d in ("reject", "unanswered") if d in decisions), "accept")
                     if "user" in sources:
                         step_source = "user"
                     elif "user_prompt" in sources:
@@ -1075,10 +1084,11 @@ def process_conversation_db(
                     )
                 )
 
-            # Tool execution results (including abandoned in-flight steps past grace window)
+            # Tool execution results. A step reaching here still in flight was abandoned; only steps that
+            # carry a tool call produce a tool_result (a planner step stuck mid-stream is not a failed tool).
             is_abandoned = status in (0, 1, 2, 9)
-            if tname or is_abandoned:
-                if dur_ms > 0 and tname:
+            if tname:
+                if dur_ms > 0:
                     add_step_metric_fn("agy.active_time.total", ts_ns, dur_ms / 1000.0, {**step_attrs, "type": "cli"})
 
                 if is_abandoned:
@@ -1242,24 +1252,6 @@ def build_logs_payload(logs: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
-def export_otlp_batch(
-    metrics_by_name: dict[str, list[dict[str, Any]]],
-    logs: list[dict[str, Any]],
-) -> tuple[bool, bool]:
-    """Post combined metrics and logs for a batch, returning (metrics_ok, logs_ok)."""
-    metrics_ok = True
-    logs_ok = True
-
-    metrics_payload = build_metrics_payload(metrics_by_name)
-    if metrics_payload is not None:
-        metrics_ok, _ = post_otlp("/v1/metrics", metrics_payload)
-
-    logs_payload = build_logs_payload(logs)
-    if logs_payload is not None:
-        logs_ok, _ = post_otlp("/v1/logs", logs_payload)
-
-    return metrics_ok, logs_ok
-
 
 def load_state() -> dict[str, Any]:
     if STATE_FILE.exists():
@@ -1289,34 +1281,52 @@ def load_state() -> dict[str, Any]:
     return {"conversations": {}}
 
 
+class StatePersistError(Exception):
+    """The cursor state cannot be saved, so nothing more may be exported until it can."""
+
+
+# Set when the collector accepted data whose cursors could only be kept in memory. The next cycle
+# saves the state before anything else, and exports nothing until that succeeds.
+_STATE_UNSAVED = False
+
+
 def ensure_state_dir_writable() -> None:
-    """Verify STATE_FILE.parent is writable before processing or POSTing so cursors can always be saved."""
+    """Fail before any POST unless the state directory takes a write of realistic size.
+
+    A zero-byte probe succeeds on a full disk, so this writes 64 KiB and fsyncs it.
+    """
     state_dir = STATE_FILE.parent
+    probe = state_dir / f".write_probe_{os.getpid()}"
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
-        probe = state_dir / f".write_probe_{os.getpid()}"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
+        try:
+            with probe.open("wb") as f:
+                f.write(b"\0" * 65536)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            with contextlib.suppress(OSError):
+                probe.unlink()
     except OSError as exc:
-        print(
-            f"[agy-exporter] FATAL: state directory {state_dir} (for {STATE_FILE}) is not writable by uid={os.getuid()}: {exc}",
-            flush=True,
-        )
-        raise
+        raise StatePersistError(f"state directory {state_dir} is not writable by uid={os.getuid()}: {exc}") from exc
 
 
 def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def persist_state(state: dict[str, Any]) -> None:
+    """Save the state; on failure, remember that memory is ahead of disk and raise StatePersistError."""
+    global _STATE_UNSAVED
     try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(STATE_FILE)
+        save_state(state)
     except OSError as exc:
-        print(
-            f"[agy-exporter] FATAL: cannot write state file {STATE_FILE} as uid={os.getuid()}: {exc}",
-            flush=True,
-        )
-        raise
+        _STATE_UNSAVED = True
+        raise StatePersistError(f"cannot write {STATE_FILE} as uid={os.getuid()}: {exc}") from exc
+    _STATE_UNSAVED = False
 
 
 def merge_metric_dicts(*dicts: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
@@ -1328,121 +1338,95 @@ def merge_metric_dicts(*dicts: dict[str, list[dict[str, Any]]]) -> dict[str, lis
     return merged
 
 
-def _commit_staged_item_state(item: dict[str, Any], conv_states: dict[str, Any]) -> bool:
-    """Update conv_states[cid] from an item's current delivery status. Returns True if conv_states[cid] changed."""
-    cid = item["cid"]
-    prev_state = item["prev_state"]
-    candidate_state = item["candidate_state"]
-    metrics_ok = item["metrics_ok"]
-    logs_ok = item["logs_ok"]
-
-    next_state = dict(prev_state)
-    next_state.pop("failed_mtime_ns", None)
-    next_state.pop("fail_count", None)
-    next_state.pop("backoff_polls_remaining", None)
-
-    if metrics_ok:
-        next_state["session_counted"] = candidate_state.get("session_counted", False)
-        next_state["last_metric_gen_idx"] = candidate_state["last_metric_gen_idx"]
-        next_state["last_metric_step_idx"] = candidate_state["last_metric_step_idx"]
-        next_state["pending_metric_steps"] = candidate_state["pending_metric_steps"]
-        next_state["pending_metric_gens"] = candidate_state["pending_metric_gens"]
-
-    if logs_ok:
-        next_state["last_log_gen_idx"] = candidate_state["last_log_gen_idx"]
-        next_state["last_log_step_idx"] = candidate_state["last_log_step_idx"]
-        next_state["pending_log_steps"] = candidate_state["pending_log_steps"]
-        next_state["pending_log_gens"] = candidate_state["pending_log_gens"]
-
-    if metrics_ok and logs_ok:
-        next_state.pop("export_rejected_mtime_ns", None)
-        next_state["mtime_ns"] = item["mtime"]
-        next_state["has_in_flight"] = item["has_in_flight"]
-    elif item.get("metrics_perm_fail") or item.get("logs_perm_fail"):
-        next_state["export_rejected_mtime_ns"] = item["mtime"]
-
-    if conv_states.get(cid) != next_state:
-        conv_states[cid] = next_state
-        return True
-    return False
+def record_fingerprint(stream: str, name: str, record: dict[str, Any]) -> str:
+    """Stable identity of one data point or log record, so a retry never sends it twice."""
+    blob = json.dumps([stream, name, record], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:24]
 
 
-def _deliver_single_conv_metrics_split(metrics_by_name: dict[str, list[dict[str, Any]]]) -> tuple[bool, bool]:
-    """Split a single conversation's metric data points into smaller sub-batches if needed."""
-    flat_pairs: list[tuple[str, dict[str, Any]]] = [
-        (m_name, dp) for m_name, dps in metrics_by_name.items() for dp in dps
-    ]
-    if len(flat_pairs) <= 1:
-        return False, False
-    payload = build_metrics_payload(metrics_by_name)
-    if payload is None or len(json.dumps(payload).encode("utf-8")) <= SINGLE_CONV_SPLIT_BYTES:
-        return False, False
-
-    sub_batches: list[dict[str, list[dict[str, Any]]]] = []
-    cur_batch: dict[str, list[dict[str, Any]]] = {}
-    cur_bytes = 256
-    for m_name, dp in flat_pairs:
-        dp_bytes = len(json.dumps(dp).encode("utf-8")) + len(m_name) + 32
-        if cur_batch and cur_bytes + dp_bytes > SINGLE_CONV_SPLIT_BYTES:
-            sub_batches.append(cur_batch)
-            cur_batch = {}
-            cur_bytes = 256
-        cur_batch.setdefault(m_name, []).append(dp)
-        cur_bytes += dp_bytes
-    if cur_batch:
-        sub_batches.append(cur_batch)
-
-    if len(sub_batches) <= 1:
-        return False, False
-
-    for sb in sub_batches:
-        sb_payload = build_metrics_payload(sb)
-        if sb_payload is None:
-            continue
-        ok, retryable = post_otlp("/v1/metrics", sb_payload)
-        if not ok:
-            return False, retryable
-    return True, False
+def _export_item(cid: str, stream: str, name: str, record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "cid": cid,
+        "name": name,
+        "record": record,
+        "fp": record_fingerprint(stream, name, record),
+        "size": len(json.dumps(record)) + len(name) + 32,
+    }
 
 
-def _deliver_single_conv_logs_split(logs: list[dict[str, Any]]) -> tuple[bool, bool]:
-    """Split a single conversation's log records into smaller sub-batches if needed."""
-    if len(logs) <= 1:
-        return False, False
-    payload = build_logs_payload(logs)
-    if payload is None or len(json.dumps(payload).encode("utf-8")) <= SINGLE_CONV_SPLIT_BYTES:
-        return False, False
+def _chunk_by_bytes(items: list[dict[str, Any]], budget: int) -> list[list[dict[str, Any]]]:
+    chunks: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    cur_bytes = 0
+    for it in items:
+        if cur and cur_bytes + it["size"] > budget:
+            chunks.append(cur)
+            cur, cur_bytes = [], 0
+        cur.append(it)
+        cur_bytes += it["size"]
+    if cur:
+        chunks.append(cur)
+    return chunks
 
-    sub_batches: list[list[dict[str, Any]]] = []
-    cur_batch: list[dict[str, Any]] = []
-    cur_bytes = 256
-    for rec in logs:
-        rec_bytes = len(json.dumps(rec).encode("utf-8")) + 16
-        if cur_batch and cur_bytes + rec_bytes > SINGLE_CONV_SPLIT_BYTES:
-            sub_batches.append(cur_batch)
-            cur_batch = []
-            cur_bytes = 256
-        cur_batch.append(rec)
-        cur_bytes += rec_bytes
-    if cur_batch:
-        sub_batches.append(cur_batch)
 
-    if len(sub_batches) <= 1:
-        return False, False
+def _stream_payload(stream: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if stream == "m":
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for it in items:
+            by_name.setdefault(it["name"], []).append(it["record"])
+        return build_metrics_payload(by_name)
+    return build_logs_payload([it["record"] for it in items])
 
-    for sb in sub_batches:
-        sb_payload = build_logs_payload(sb)
-        if sb_payload is None:
-            continue
-        ok, retryable = post_otlp("/v1/logs", sb_payload)
-        if not ok:
-            return False, retryable
-    return True, False
+
+def deliver_stream(stream: str, items: list[dict[str, Any]], settle: Any) -> bool:
+    """Send items in requests of at most MAX_BATCH_BYTES and settle each with the collector.
+
+    A request the collector refuses as bad (400) or too large (413) is split in half and both halves
+    are sent, down to single records; a single record still refused is settled as dropped.
+    `settle(stream, items, accepted)` runs after every request the collector answers for good.
+    Returns False when a retryable failure stops delivery; whatever was settled stays settled.
+    """
+    path = "/v1/metrics" if stream == "m" else "/v1/logs"
+
+    def send(chunk: list[dict[str, Any]]) -> bool:
+        payload = _stream_payload(stream, chunk)
+        if payload is None:
+            return True
+        outcome = post_otlp(path, payload)
+        if outcome == "ok":
+            settle(stream, chunk, True)
+            return True
+        if outcome == "retry":
+            return False
+        if len(chunk) == 1:
+            settle(stream, chunk, False)
+            return True
+        mid = len(chunk) // 2
+        return send(chunk[:mid]) and send(chunk[mid:])
+
+    return all(send(chunk) for chunk in _chunk_by_bytes(items, MAX_BATCH_BYTES))
+
+
+_CURSOR_KEYS = {
+    "m": ("session_counted", "last_metric_gen_idx", "last_metric_step_idx", "pending_metric_steps", "pending_metric_gens"),
+    "l": ("last_log_gen_idx", "last_log_step_idx", "pending_log_steps", "pending_log_gens"),
+}
+# Written by earlier versions and no longer read.
+_RETIRED_KEYS = ("export_rejected_mtime_ns", "summary_grace_waited", "last_gen_idx", "last_step_idx", "pending_steps")
 
 
 def sync_once(state: dict[str, Any], tmp_dir: Path, persist: bool = True) -> bool:
-    """Process all conversations with per-conversation isolation, chunked/split OTLP export, and per-chunk state save."""
+    """Export the new telemetry of every changed conversation.
+
+    Each conversation is read in isolation. Its records are delivered in size-bounded requests, and its
+    cursors for a stream (metrics or logs) advance only once every record of that stream is settled:
+    accepted, or refused by the collector as bad data. Until then the conversation keeps a ledger of
+    the settled records ("settled"), saved after every accepted request, so a retry after any failure,
+    a crash included, sends only what the collector has not answered for good.
+    """
     if persist:
+        if _STATE_UNSAVED:
+            persist_state(state)  # memory is ahead of disk: catch up before sending anything new
         ensure_state_dir_writable()
 
     surfaces = [
@@ -1452,6 +1436,7 @@ def sync_once(state: dict[str, Any], tmp_dir: Path, persist: bool = True) -> boo
     conv_states: dict[str, Any] = state.setdefault("conversations", {})
     staged: list[dict[str, Any]] = []
     state_dirty = False
+    now_ns = time.time_ns()
 
     for surface_name, surface_dir in surfaces:
         conv_dir = surface_dir / "conversations"
@@ -1483,9 +1468,13 @@ def sync_once(state: dict[str, Any], tmp_dir: Path, persist: bool = True) -> boo
                 state_dirty = True
                 continue
 
-            if prev_state.get("failed_mtime_ns") == mtime or prev_state.get("export_rejected_mtime_ns") == mtime:
+            if prev_state.get("failed_mtime_ns") == mtime:
                 continue
-            if prev_state.get("mtime_ns") == mtime and not prev_state.get("has_in_flight"):
+            # Unchanged since the last full export: skip, unless steps were in flight and the conversation
+            # has now been idle long enough to export them as abandoned.
+            if prev_state.get("mtime_ns") == mtime and not (
+                prev_state.get("has_in_flight") and now_ns >= int(prev_state.get("abandon_check_ns", 0))
+            ):
                 continue
 
             try:
@@ -1519,226 +1508,123 @@ def sync_once(state: dict[str, Any], tmp_dir: Path, persist: bool = True) -> boo
                 state_dirty = True
                 continue
 
-            combined_metrics = merge_metric_dicts(gen_m, step_m)
-            dps_count = sum(len(v) for v in combined_metrics.values())
-
-            if dps_count == 0 and not logs:
-                candidate_state.pop("failed_mtime_ns", None)
-                candidate_state.pop("fail_count", None)
-                candidate_state.pop("backoff_polls_remaining", None)
-                candidate_state.pop("export_rejected_mtime_ns", None)
-                candidate_state["mtime_ns"] = mtime
-                candidate_state["has_in_flight"] = has_in_flight
-                if conv_states.get(cid) != candidate_state:
-                    conv_states[cid] = candidate_state
-                    state_dirty = True
-                continue
-
-            est_bytes = len(json.dumps(combined_metrics).encode("utf-8")) + len(json.dumps(logs).encode("utf-8"))
+            items = {
+                "m": [
+                    _export_item(cid, "m", m_name, dp)
+                    for m_name, dps in merge_metric_dicts(gen_m, step_m).items()
+                    for dp in dps
+                ],
+                "l": [_export_item(cid, "l", "", rec) for rec in logs],
+            }
             staged.append(
                 {
                     "cid": cid,
                     "mtime": mtime,
                     "has_in_flight": has_in_flight,
-                    "metrics": combined_metrics,
-                    "dps_count": dps_count,
-                    "logs": logs,
-                    "log_count": len(logs),
-                    "est_bytes": est_bytes,
+                    "items": items,
                     "prev_state": prev_state,
                     "candidate_state": candidate_state,
-                    "metrics_ok": dps_count == 0,
-                    "logs_ok": len(logs) == 0,
-                    "metrics_perm_fail": False,
-                    "logs_perm_fail": False,
                 }
             )
 
-    any_exported = False
-    total_dps = 0
-    total_logs = 0
+    # Working state per staged conversation: committed cursors plus a private copy of its ledger.
+    work: dict[str, dict[str, Any]] = {}
+    for item in staged:
+        st = dict(item["prev_state"])
+        st["settled"] = {s: list(v) for s, v in item["prev_state"].get("settled", {}).items()}
+        work[item["cid"]] = st
 
-    def deliver_metrics_group(group: list[dict[str, Any]]) -> None:
-        nonlocal any_exported, total_dps, state_dirty
-        active = [it for it in group if not it["metrics_ok"]]
-        if not active:
-            return
-        merged_m = merge_metric_dicts(*(it["metrics"] for it in active))
-        payload = build_metrics_payload(merged_m)
-        if payload is None:
-            for it in active:
-                it["metrics_ok"] = True
-                if _commit_staged_item_state(it, conv_states):
-                    state_dirty = True
-            if state_dirty and persist:
-                save_state(state)
-                state_dirty = False
-            return
+    sent = {"m": 0, "l": 0}
+    refused: dict[tuple[str, str], int] = {}
 
-        ok, retryable = post_otlp("/v1/metrics", payload)
-        if ok:
-            for it in active:
-                it["metrics_ok"] = True
-                any_exported = True
-                total_dps += it["dps_count"]
-                if _commit_staged_item_state(it, conv_states):
-                    state_dirty = True
-            if state_dirty and persist:
-                save_state(state)
-                state_dirty = False
-            return
-
-        if not retryable:
-            if len(active) > 1:
-                mid = len(active) // 2
-                deliver_metrics_group(active[:mid])
-                deliver_metrics_group(active[mid:])
-                return
-            single = active[0]
-            split_ok, split_retryable = _deliver_single_conv_metrics_split(single["metrics"])
-            if split_ok:
-                single["metrics_ok"] = True
-                any_exported = True
-                total_dps += single["dps_count"]
-                if _commit_staged_item_state(single, conv_states):
-                    state_dirty = True
-                if state_dirty and persist:
-                    save_state(state)
-                    state_dirty = False
-                return
-            if not split_retryable:
-                single["metrics_perm_fail"] = True
-                print(
-                    f"[agy-exporter] Conversation {single['cid']} metrics permanently rejected by collector "
-                    f"(mtime={single['mtime']}); isolating and skipping until modified",
-                    flush=True,
-                )
-                if _commit_staged_item_state(single, conv_states):
-                    state_dirty = True
-                if state_dirty and persist:
-                    save_state(state)
-                    state_dirty = False
-
-    def deliver_logs_group(group: list[dict[str, Any]]) -> None:
-        nonlocal any_exported, total_logs, state_dirty
-        active = [it for it in group if not it["logs_ok"]]
-        if not active:
-            return
-        merged_logs: list[dict[str, Any]] = []
-        for it in active:
-            merged_logs.extend(it["logs"])
-        payload = build_logs_payload(merged_logs)
-        if payload is None:
-            for it in active:
-                it["logs_ok"] = True
-                if _commit_staged_item_state(it, conv_states):
-                    state_dirty = True
-            if state_dirty and persist:
-                save_state(state)
-                state_dirty = False
-            return
-
-        ok, retryable = post_otlp("/v1/logs", payload)
-        if ok:
-            for it in active:
-                it["logs_ok"] = True
-                any_exported = True
-                total_logs += it["log_count"]
-                if _commit_staged_item_state(it, conv_states):
-                    state_dirty = True
-            if state_dirty and persist:
-                save_state(state)
-                state_dirty = False
-            return
-
-        if not retryable:
-            if len(active) > 1:
-                mid = len(active) // 2
-                deliver_logs_group(active[:mid])
-                deliver_logs_group(active[mid:])
-                return
-            single = active[0]
-            split_ok, split_retryable = _deliver_single_conv_logs_split(single["logs"])
-            if split_ok:
-                single["logs_ok"] = True
-                any_exported = True
-                total_logs += single["log_count"]
-                if _commit_staged_item_state(single, conv_states):
-                    state_dirty = True
-                if state_dirty and persist:
-                    save_state(state)
-                    state_dirty = False
-                return
-            if not split_retryable:
-                single["logs_perm_fail"] = True
-                print(
-                    f"[agy-exporter] Conversation {single['cid']} logs permanently rejected by collector "
-                    f"(mtime={single['mtime']}); isolating and skipping until modified",
-                    flush=True,
-                )
-                if _commit_staged_item_state(single, conv_states):
-                    state_dirty = True
-                if state_dirty and persist:
-                    save_state(state)
-                    state_dirty = False
-
-    if staged:
-        chunks: list[list[dict[str, Any]]] = []
-        cur_chunk: list[dict[str, Any]] = []
-        cur_chunk_bytes = 0
-        for item in staged:
-            if cur_chunk and cur_chunk_bytes + item["est_bytes"] > MAX_BATCH_BYTES:
-                chunks.append(cur_chunk)
-                cur_chunk = []
-                cur_chunk_bytes = 0
-            cur_chunk.append(item)
-            cur_chunk_bytes += item["est_bytes"]
-        if cur_chunk:
-            chunks.append(cur_chunk)
-
-        for chunk in chunks:
-            deliver_metrics_group(chunk)
-            deliver_logs_group(chunk)
-            for item in chunk:
-                if _commit_staged_item_state(item, conv_states):
-                    state_dirty = True
-            if state_dirty and persist:
-                save_state(state)
+    def settle(stream: str, chunk: list[dict[str, Any]], accepted: bool) -> None:
+        nonlocal state_dirty
+        for it in chunk:
+            work[it["cid"]]["settled"].setdefault(stream, []).append(it["fp"])
+            conv_states[it["cid"]] = work[it["cid"]]
+            if not accepted:
+                refused[(it["cid"], stream)] = refused.get((it["cid"], stream), 0) + 1
+        state_dirty = True
+        if accepted:
+            sent[stream] += len(chunk)
+            if persist:
+                # Record what the collector now holds before sending anything else.
+                persist_state(state)
                 state_dirty = False
 
-        failed_items = [it for it in staged if not (it["metrics_ok"] and it["logs_ok"])]
-        if failed_items:
-            print(
-                f"[agy-exporter] Partial/failed OTLP export for {len(failed_items)}/{len(staged)} conversation(s); "
-                f"committed succeeded stream cursors",
-                flush=True,
-            )
+    pending = {"m": [], "l": []}
+    for item in staged:
+        for s in ("m", "l"):
+            ledger = set(work[item["cid"]]["settled"].get(s, []))
+            pending[s].extend(x for x in item["items"][s] if x["fp"] not in ledger)
+    delivered = {s: deliver_stream(s, pending[s], settle) for s in ("m", "l")}
 
-    if state_dirty and persist:
-        save_state(state)
-
-    if any_exported:
+    for (cid, s), n in sorted(refused.items()):
+        kind = "data point(s)" if s == "m" else "log record(s)"
+        print(f"[agy-exporter] Collector refused {n} {kind} from conversation {cid} as invalid; dropped them", flush=True)
+    if not all(delivered.values()):
         print(
-            f"[agy-exporter] Exported {total_dps} metric points and {total_logs} log events",
+            f"[agy-exporter] Partial/failed OTLP export (metrics delivered={delivered['m']}, "
+            f"logs delivered={delivered['l']}); the rest is retried next poll",
             flush=True,
         )
-    return any_exported
+
+    for item in staged:
+        cid, st, cand = item["cid"], work[item["cid"]], item["candidate_state"]
+        settled = st["settled"]
+        done = {}
+        for s in ("m", "l"):
+            ledger = set(settled.get(s, []))
+            done[s] = all(x["fp"] in ledger for x in item["items"][s])
+            if done[s]:
+                for key in _CURSOR_KEYS[s]:
+                    if key in cand:
+                        st[key] = cand[key]
+                settled.pop(s, None)
+        if not settled:
+            st.pop("settled")
+        if done["m"] and done["l"]:
+            for key in ("failed_mtime_ns", "fail_count", "backoff_polls_remaining") + _RETIRED_KEYS:
+                st.pop(key, None)
+            st["mtime_ns"] = item["mtime"]
+            st["has_in_flight"] = item["has_in_flight"]
+            if item["has_in_flight"]:
+                st["abandon_check_ns"] = item["mtime"] + int(ABANDON_IDLE_SEC * 1e9)
+            else:
+                st.pop("abandon_check_ns", None)
+        if conv_states.get(cid) != st:
+            conv_states[cid] = st
+            state_dirty = True
+
+    if state_dirty and persist:
+        persist_state(state)
+
+    if sent["m"] or sent["l"]:
+        print(f"[agy-exporter] Exported {sent['m']} metric points and {sent['l']} log events", flush=True)
+    return bool(sent["m"] or sent["l"])
 
 
 def main() -> None:
     print(f"[agy-exporter] Watching {GEMINI_DIR} -> {OTLP_HTTP_ENDPOINT}", flush=True)
+    try:
+        ensure_state_dir_writable()
+    except StatePersistError as exc:
+        # Nothing has been sent yet, so exiting loses nothing, and the restart loop makes it visible.
+        print(f"[agy-exporter] FATAL: {exc}", flush=True)
+        sys.exit(1)
     state = load_state()
+    last_paused_log = float("-inf")
     with tempfile.TemporaryDirectory(prefix="agy-db-") as tmp_str:
         tmp_dir = Path(tmp_str)
         while True:
             try:
                 sync_once(state, tmp_dir, persist=True)
-            except (PermissionError, OSError) as exc:
-                print(
-                    f"[agy-exporter] Exiting due to state file/directory error at {STATE_FILE} (uid={os.getuid()}): {exc}",
-                    flush=True,
-                )
-                sys.exit(1)
+            except StatePersistError as exc:
+                # Never exit here: the cursors in memory are the only record of what the collector has
+                # already accepted, and restarting from the last saved state would send it again.
+                if time.monotonic() - last_paused_log >= 60:
+                    last_paused_log = time.monotonic()
+                    print(f"[agy-exporter] Export paused until state can be saved: {exc}", flush=True)
             except Exception as exc:
                 print(f"[agy-exporter] Unexpected loop error: {exc}", flush=True)
             time.sleep(POLL_INTERVAL_SEC)

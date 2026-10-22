@@ -30,9 +30,9 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, bool(ok), detail))
 
 
-def scenario(name: str, gemini: Path, work: Path) -> list[dict]:
+def scenario(name: str, gemini: Path, work: Path, tag: str | None = None) -> list[dict]:
     p = subprocess.run(
-        [sys.executable, "-I", "-B", str(HERE / "smoke.py"), name, str(EXPORTER), str(gemini), str(work / name)],
+        [sys.executable, "-I", "-B", str(HERE / "smoke.py"), name, str(EXPORTER), str(gemini), str(work / (tag or name))],
         capture_output=True, text=True, timeout=900,
     )
     cycles = [json.loads(line[2:]) for line in p.stdout.splitlines() if line.startswith("@@")]
@@ -61,14 +61,14 @@ def interpolate(value: str, env: dict[str, str]) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?-([^}]*))?\}", sub, value)
 
 
-def agy_mounts() -> list[tuple[Path, str]]:
+def agy_mounts(files: list[Path] | None = None) -> list[tuple[Path, str]]:
     """(host source, path under /gemini in the container) for every agy-exporter* service.
 
     Reads every compose file Compose itself would (COMPOSE_FILE), so override files count.
     Understands both short (`src:dst:ro`) and long (`type: bind` / `source:` / `target:`) syntax.
     """
     env, out = compose_env(), []
-    text = "\n".join(f.read_text() for f in COMPOSE_FILES)
+    text = "\n".join(f.read_text() for f in (files or COMPOSE_FILES))
     for svc in re.finditer(r"^  (agy-exporter[\w-]*):\n(.*?)(?=^  \S|^\S|\Z)", text, re.S | re.M):
         lines = svc.group(2).splitlines()
         start = next((i for i, l in enumerate(lines) if l.rstrip() == "    volumes:"), None)
@@ -177,13 +177,15 @@ def api_error_checks() -> None:
 
 
 def main() -> int:
-    global COMPOSE_FILES
+    global COMPOSE_FILES, EXPORTER
     ap = argparse.ArgumentParser()
     ap.add_argument("--gemini", type=Path, default=Path.home() / ".gemini")
+    ap.add_argument("--exporter", type=Path, default=EXPORTER, help="exporter.py to test (default: the one in the repo)")
     ap.add_argument("--compose", type=Path, action="append",
                     help="compose file(s) to check the mounts of; default: COMPOSE_FILE from the environment or .env")
     args = ap.parse_args()
     args.gemini = args.gemini.expanduser().absolute()
+    EXPORTER = args.exporter.expanduser().absolute()
     if args.compose:
         COMPOSE_FILES = [p.expanduser().absolute() for p in args.compose]
     else:
@@ -216,8 +218,10 @@ def main() -> int:
               f"processed {c2['convs_processed']}, ingested {c2['items_ingested']}")
         check("a restart resumes from persisted cursors", c3["items_ingested"] == 0,
               f"re-ingested {c3['items_ingested']} items")
-        check("steps stuck past the grace window are emitted, not pinned", c1["pending_steps_total"] == 0,
-              f"{c1['pending_steps_total']} step(s) pinned in pending")
+        idle_window = 3600  # ABANDON_IDLE_SEC as smoke.py sets it
+        stale = [p for p in c1["pending"] if p["idle_sec"] >= idle_window]
+        check("no step stays pending in a conversation idle past the abandonment window", not stale,
+              f"pending in idle conversations: {stale}")
 
         last = scenario("unwritable-state", snap, work)[-1]
         check("an unwritable state dir never causes re-export after restart", last["duplicates_ingested"] == 0,
@@ -240,6 +244,92 @@ def main() -> int:
               f"{lim[-1]['convs_metric_cursor_advanced']}/{lim[-1]['tracked_convs']} cursors advanced, "
               f"largest POST {max(c['max_post_bytes'] for c in lim) / 1e6:.1f} MB")
 
+        ls1, ls2 = scenario("long-running-step", snap, work)
+        check("a step still running in a live session is not reported as abandoned",
+              ls1["abandoned_results"] + ls2["abandoned_results"] == 0,
+              f"{ls1['abandoned_results'] + ls2['abandoned_results']} abandoned tool_result(s)")
+        check("a long-running step's real result is exported when it completes",
+              ls2["emitted"].get("agy.tool_result", 0) == 1,
+              f"{ls2['emitted'].get('agy.tool_result', 0)} tool_result(s) exported when the step completed")
+
+        cs1, cs2, cs3 = scenario("crashed-session", snap, work)
+        check("in-flight steps stay pending while the session was active recently",
+              cs1["abandoned_results"] == 0, f"{cs1['abandoned_results']} reported abandoned after 60 s idle")
+        check("in-flight tool steps of an idle session are emitted as abandoned, once",
+              cs2["abandoned_results"] == 2 and cs3["items_ingested"] == 0,
+              f"{cs2['abandoned_results']} abandoned after an hour idle (want 2), {cs3['items_ingested']} re-sent")
+        check("an unanswered permission prompt is not recorded as an approval",
+              sum(cs2["decisions"].values()) == 1 and cs2["decisions"].get("accept", 0) == 0,
+              f"decisions when abandoned: {cs2['decisions']}")
+        check("an abandoned step without a tool call emits no tool_result",
+              cs2["unknown_tool_results"] == 0 and cs2["emitted"].get("agy.tool_result", 0) == 2,
+              f"{cs2['emitted'].get('agy.tool_result', 0)} tool_results (want 2), "
+              f"{cs2['unknown_tool_results']} with tool_name 'unknown'")
+
+        q1, q2 = scenario("session-goes-quiet", snap, work)
+        check("a silent session's in-flight steps are exported once the idle window passes, with no write",
+              q1["abandoned_results"] == 0 and q2["abandoned_results"] == 2,
+              f"abandoned {q1['abandoned_results']} while fresh and {q2['abandoned_results']} after the window "
+              f"(want 0 and 2)")
+
+        me = scenario("misconfigured-endpoint", snap, work)
+        got = sum(c["items_ingested"] for c in me)
+        check("an auth or routing error (401, 404) holds the data and recovers once fixed",
+              me[-1]["convs_metric_cursor_advanced"] == me[-1]["tracked_convs"]
+              and me[-1]["convs_log_cursor_advanced"] == me[-1]["tracked_convs"]
+              and got == c1["items_ingested"] and sum(c["duplicates_ingested"] for c in me) == 0,
+              f"{got}/{c1['items_ingested']} items once fixed, "
+              f"{me[-1]['convs_metric_cursor_advanced']}/{me[-1]['tracked_convs']} metric cursors advanced")
+
+        sp = scenario("subbatch-partial-failure", snap, work)
+        bad = [r["cycle"] for r in sp
+               if r["duplicates_ingested"] or r["items_ingested"] != c1["items_ingested"]
+               or r["convs_metric_cursor_advanced"] != r["tracked_convs"]
+               or r["convs_log_cursor_advanced"] != r["tracked_convs"]]
+        check("a request failing mid-delivery is retried without re-sending accepted data", not bad,
+              f"wrong for: {bad}; duplicates per case {[r['duplicates_ingested'] for r in sp]}")
+
+        cr = scenario("crash-mid-delivery", snap, work)
+        bad = [r["cycle"] for r in cr
+               if r["duplicates_ingested"] or r["items_ingested"] != c1["items_ingested"]
+               or r["convs_metric_cursor_advanced"] != r["tracked_convs"]
+               or r["convs_log_cursor_advanced"] != r["tracked_convs"]]
+        check("a crash between requests neither loses nor duplicates anything after the restart", not bad,
+              f"wrong for: {bad}; duplicates per case {[r['duplicates_ingested'] for r in cr]}")
+
+        pr1, pr2, pr3 = scenario("poisoned-record", snap, work)
+        got = pr1["items_ingested"] + pr2["items_ingested"] + pr3["items_ingested"]
+        check("a refused record is dropped alone and the rest of its conversation is exported",
+              pr3["poison_ingested"] == 0 and got == c1["items_ingested"] - 1,
+              f"{got}/{c1['items_ingested'] - 1} items ingested")
+        check("a transient logs failure is retried for an idle conversation",
+              pr2["convs_log_cursor_advanced"] == pr2["tracked_convs"],
+              f"{pr2['convs_log_cursor_advanced']}/{pr2['tracked_convs']} log cursors advanced after the retry")
+        check("a refused record is not re-sent when its conversation changes",
+              pr3["items_ingested"] == 0 and "400" not in pr3["statuses"],
+              f"after the change: {pr3['items_ingested']} items, responses {pr3['statuses']}")
+
+        cl = scenario("close-on-large", snap, work)
+        check("a collector that drops the connection on oversized bodies still makes progress",
+              cl[-1]["convs_metric_cursor_advanced"] == cl[-1]["tracked_convs"]
+              and sum(c["duplicates_ingested"] for c in cl) == 0,
+              f"{cl[-1]['convs_metric_cursor_advanced']}/{cl[-1]['tracked_convs']} cursors advanced, "
+              f"responses per poll {[c['statuses'] for c in cl]}")
+
+        sf1, sf2 = scenario("save-fails-after-post", snap, work)
+        check("a failed state save after a POST neither exits nor duplicates after a restart",
+              sf1["exited"] is None and sf1["duplicates_ingested"] + sf2["duplicates_ingested"] == 0
+              and sf2["state_file_written"],
+              f"exited={sf1['exited']}, duplicates {sf1['duplicates_ingested']}+{sf2['duplicates_ingested']}, "
+              f"state written={sf2['state_file_written']}")
+        check("nothing more is sent while the state cannot be saved",
+              sf1["posts_per_poll"][0] > 0 and sf1["posts_per_poll"][1:3] == [0, 0],
+              f"POSTs per poll {sf1['posts_per_poll']} (disk full for polls 1-3)")
+
+        base_only = agy_mounts([REPO / "docker-compose.yml"])
+        check("the base compose file mounts no Antigravity data (each surface is an opt-in override)",
+              not base_only, f"docker-compose.yml alone mounts {[rel for _, rel in base_only]}")
+
         exposed = exposed_files(args.gemini)
         check("the container's mounts expose nothing the exporter doesn't read (credentials, history)",
               not exposed, f"{len(exposed)} extra file(s), e.g. {exposed[:4]}")
@@ -251,6 +341,20 @@ def main() -> int:
               and cm["distinct_agent_names"] == c1["distinct_agent_names"],
               f"container sees {cm['sessions']}/{c1['sessions']} conversations, surfaces {cm['surfaces']}, "
               f"agent names {cm['distinct_agent_names']}/{c1['distinct_agent_names']} (mounts: {mounted})")
+
+        nosum = work / "no-summaries"
+        for surface in ("antigravity-cli", "antigravity"):
+            for sub in ("conversations", "brain"):
+                if (snap / surface / sub).exists():
+                    (nosum / surface).mkdir(parents=True, exist_ok=True)
+                    os.symlink(snap / surface / sub, nosum / surface / sub)
+        ns = scenario("compose-mounts", nosum, work, tag="no-summaries")[0]
+        if c1["distinct_agent_names"]:
+            check("agent names come from each conversation's own database, not only the summaries file",
+                  ns["distinct_agent_names"] == c1["distinct_agent_names"],
+                  f"{ns['distinct_agent_names']}/{c1['distinct_agent_names']} agent names without conversation_summaries.db")
+        else:
+            check("agent names come from each conversation's own database (no subagent in the data: not exercised)", True)
 
         wal = subprocess.run([sys.executable, "-I", "-B", str(HERE / "walcheck.py"), str(EXPORTER)],
                              capture_output=True, text=True, timeout=120)

@@ -47,24 +47,6 @@ services:
       STATE_FILE: /state/state.json
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     volumes:
-      - type: bind
-        source: ${AGY_CLI_DIR:-~/.gemini/antigravity-cli}/conversations
-        target: /gemini/antigravity-cli/conversations
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${AGY_CLI_DIR:-~/.gemini/antigravity-cli}/brain
-        target: /gemini/antigravity-cli/brain
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${AGY_CLI_DIR:-~/.gemini/antigravity-cli}/conversation_summaries.db
-        target: /gemini/antigravity-cli/conversation_summaries.db
-        read_only: true
-        bind:
-          create_host_path: false
       - agy-exporter-state:/state
     depends_on:
       otel-collector:

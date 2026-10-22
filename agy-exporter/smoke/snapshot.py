@@ -4,9 +4,12 @@
 Copies only what the exporter opens, per surface: conversations/*.db,
 conversation_summaries.db (both via sqlite3 backup, so a live WAL is folded in
 consistently) and brain/<cid>/.system_generated/logs/transcript.jsonl.
+Each copy keeps its source's mtime (the later of the .db and its -wal), because
+the exporter decides whether a session is idle from that mtime.
 
 usage: snapshot.py <src ~/.gemini> <dest dir>
 """
+import os
 import shutil
 import sqlite3
 import sys
@@ -17,6 +20,8 @@ src_root, dst_root = Path(sys.argv[1]), Path(sys.argv[2])
 
 def backup_db(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
+    wal = Path(f"{src}-wal")
+    mtime_ns = max(src.stat().st_mtime_ns, wal.stat().st_mtime_ns if wal.exists() else 0)
     source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     dest = sqlite3.connect(dst)
     try:
@@ -24,6 +29,7 @@ def backup_db(src: Path, dst: Path) -> None:
     finally:
         dest.close()
         source.close()
+    os.utime(dst, ns=(mtime_ns, mtime_ns))
 
 
 for surface in ("antigravity-cli", "antigravity"):

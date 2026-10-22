@@ -1,3 +1,4 @@
+# Antigravity desktop app data for agy-exporter. Enable with COMPOSE_FILE in .env; see README.md.
 services:
   agy-exporter:
     volumes:

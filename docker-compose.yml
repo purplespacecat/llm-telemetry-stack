@@ -38,6 +38,20 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  agy-exporter:
+    build: ./agy-exporter
+    environment:
+      GEMINI_DIR: /gemini
+      STATE_FILE: /state/state.json
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    volumes:
+      - ${GEMINI_DIR:-~/.gemini}:/gemini:ro
+      - agy-exporter-state:/state
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana:13.2.2
     environment:
@@ -66,3 +80,4 @@ services:
 volumes:
   clickhouse-data:
   grafana-data:
+  agy-exporter-state:

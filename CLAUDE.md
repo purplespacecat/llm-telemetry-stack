@@ -1,10 +1,10 @@
 # llm-telemetry-stack
 
-Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse and shows it in Grafana. Public repo: keep it generic, with no employer-specific names, endpoints or settings.
+Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemetry data in ClickHouse and shows it in Grafana. Public repo: keep it generic, with no employer-specific names, endpoints or settings.
 
 `README.md` is for users: setup, running, what the dashboard shows. Keep it short; internals and gotchas go here.
 
-## Data shape
+## Data shape (Claude Code)
 
 - Claude Code exports metrics with delta temporality (`AggregationTemporality = 1` in `otel.otel_metrics_sum`), so `sum(Value)` per bucket is the usage in that bucket. Don't use `max` or rate functions.
 - Event names live in `LogAttributes['event.name']`. The exporter's `EventName` column stays empty for Claude Code events (collector 0.161.0, Claude Code 2.1.303).
@@ -14,6 +14,14 @@ Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse an
 - Failed `tool_result` events carry `error_type` (such as `ShellError`) with or without the flag.
 - `hook_execution_complete` is per hook event and matcher (`hook_name` such as `PreToolUse:Bash`), not per hook command. `hook_registered` lists each configured hook with `hook_source` and `plugin.name`.
 - `mcp_server_connection` rows with `status = 'disconnected'` carry the connection lifetime in `duration_ms`, not the connect time.
+
+## Data shape (Antigravity / `agy`)
+
+- Antigravity does not export OTLP natively. `agy-exporter/exporter.py` mounts `~/.gemini` read-only (`antigravity-cli` for CLI and `antigravity` for desktop), copies active SQLite `.db` + `-wal` files (excluding `-shm` so SQLite reconstructs a fresh WAL index) to `/tmp` per poll, deletes the temporary copies immediately after reading, and exports delta metrics (`agy.*`) and log events (`agy.*`) via OTLP/HTTP JSON to `otel-collector:4318`.
+- Per-conversation SQLite databases (`conversations/<id>.db`) hold internal Cortex protobuf blobs (field numbers documented in the `agy-exporter/exporter.py` module docstring): `gen_metadata` (per-request `input_tokens`, `cache_read_tokens`, `output_tokens`, `thinking_tokens`, `duration`, `ttft`, and `model`), `steps` (tool calls, status transition timestamps in field `26`, `permissions`, and `error_details`), and `trajectory_metadata_blob` (`vcs.repository.name` and `vcs.branch.name`).
+- `transcript.jsonl` supplements `steps` with command exit codes (`Command exited with code N`) and `<USER_SETTINGS_CHANGE>` model changes.
+- Progressive disclosure skill activations are detected when `read_file` or `view_file` reads `.../skills/<name>/SKILL.md` (`agy.skill_activated`), tagging subsequent cost/token points in that session with `skill.name`.
+- Each conversation is isolated in its own `try/except` block and exports independently. Metric cursors (`last_metric_gen_idx`, `last_metric_step_idx`) and log cursors (`last_log_gen_idx`, `last_log_step_idx`) are committed separately per conversation in the `agy-exporter-state` volume so a single malformed conversation or partial OTLP failure cannot wedge the exporter or duplicate metrics on retry.
 
 ## Tool details filter
 

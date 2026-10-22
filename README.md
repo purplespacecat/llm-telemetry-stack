@@ -1,9 +1,11 @@
 # llm-telemetry-stack
 
-Local Grafana dashboards for your Claude Code usage: what it costs, how you use it and what fails. Everything runs on your machine.
+Local Grafana dashboards for your Claude Code and Antigravity (`agy`) usage: what it costs, how you use it and what fails. Everything runs on your machine.
 
 ```text
-Claude Code ──OTLP──> OpenTelemetry Collector ──> ClickHouse ──> Grafana
+Claude Code ─────────────────OTLP──┐
+                                   ├──> OpenTelemetry Collector ──> ClickHouse ──> Grafana
+~/.gemini ──> agy-exporter ──OTLP──┘
 ```
 
 ## Set up
@@ -13,10 +15,12 @@ You need Docker with the `docker compose` plugin.
 1. Start the stack:
 
    ```bash
-   docker compose up -d
+   docker compose up -d --build
    ```
 
-2. Turn on telemetry by merging [`claude-code/settings.json`](claude-code/settings.json) into `~/.claude/settings.json`:
+2. **Antigravity (`agy`):** Works out of the box. The `agy-exporter` sidecar reads `~/.gemini` (`antigravity-cli` and `antigravity` desktop) read-only, backfills existing sessions and streams new turns.
+
+3. **Claude Code:** Turn on telemetry by merging [`claude-code/settings.json`](claude-code/settings.json) into `~/.claude/settings.json`:
 
    ```bash
    jq -s '.[0] * .[1]' ~/.claude/settings.json claude-code/settings.json > /tmp/claude-settings.json \
@@ -25,15 +29,15 @@ You need Docker with the `docker compose` plugin.
 
    If you don't have `~/.claude/settings.json` yet, copy the file instead.
 
-3. Start a new Claude Code session and open <http://localhost:3000>. Data appears within a minute.
+4. Open <http://localhost:3000>. Data appears within a minute.
 
 ## Dashboards
 
-There are three dashboards, linked from each other's header. **Claude Code cost** opens as the home page, with no login.
+There are three dashboards for Claude Code and three for Antigravity, linked from each other's header. **Claude Code cost** opens as the home page, with no login.
 
-- **Claude Code cost:** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, source (main loop, subagents, skills, MCP servers) and session
-- **Claude Code efficiency:** active time, lines of code, commits and pull requests; which skills ran, whether you or Claude triggered them, and sessions with no skills; tool latency and permission prompts; MCP servers used; hook time and configured hooks
-- **Claude Code reliability:** API errors, error rate, retries and latency; failed tool calls by tool and error type; MCP connection failures; hook errors
+- **Cost (`Claude Code cost` / `Antigravity cost`):** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, source (main loop, subagents, skills, MCP servers) and session
+- **Efficiency (`Claude Code efficiency` / `Antigravity efficiency`):** active time, lines of code, commits and pull requests; which skills ran, whether you or the agent triggered them, and sessions with no skills; tool latency and permission prompts; MCP servers, hooks and subagents used
+- **Reliability (`Claude Code reliability` / `Antigravity reliability`):** API errors, error rate, retries and latency; failed tool calls by tool and error type; MCP connection/tool failures; hook and subagent errors
 
 Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
 
@@ -63,6 +67,7 @@ To change credentials or ports, set these in a `.env` file next to `docker-compo
 | `GRAFANA_CLICKHOUSE_PASSWORD` | `grafana` |
 | `GRAFANA_PORT` | `3000` |
 | `OTLP_GRPC_PORT` / `OTLP_HTTP_PORT` | `4317` / `4318` |
+| `GEMINI_DIR` | `~/.gemini` |
 
 If you change `OTLP_GRPC_PORT`, change the port in `OTEL_EXPORTER_OTLP_ENDPOINT` in your Claude Code settings too.
 

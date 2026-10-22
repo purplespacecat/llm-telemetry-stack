@@ -15,10 +15,11 @@ You need Docker with the `docker compose` plugin.
 1. Start the stack:
 
    ```bash
-   docker compose up -d --build
+   docker compose up -d                 # Claude Code only
+   docker compose --profile agy up -d   # Claude Code + Antigravity (agy)
    ```
 
-2. **Antigravity (`agy`):** Works out of the box. The `agy-exporter` sidecar reads `~/.gemini` (`antigravity-cli` and `antigravity` desktop) read-only, backfills existing sessions and streams new turns.
+2. **Antigravity (`agy`):** When started with `--profile agy` (or `COMPOSE_PROFILES=agy` in `.env`), the `agy-exporter` sidecar mounts `~/.gemini/antigravity-cli/{conversations,brain,conversation_summaries.db}` read-only as a non-root user (`1000:1000`) with `bind.create_host_path: false` and stores cursor state in `/state/state.json` (`STATE_FILE`). To also export Antigravity Desktop (`~/.gemini/antigravity/{conversations,brain,conversation_summaries.db}`), include [`docker-compose.agy-desktop.yml`](docker-compose.agy-desktop.yml) via `COMPOSE_FILE=docker-compose.yml:docker-compose.agy-desktop.yml` in `.env` (CLI-only machines can omit `docker-compose.agy-desktop.yml` without creating dummy host directories).
 
 3. **Claude Code:** Turn on telemetry by merging [`claude-code/settings.json`](claude-code/settings.json) into `~/.claude/settings.json`:
 
@@ -67,9 +68,21 @@ To change credentials or ports, set these in a `.env` file next to `docker-compo
 | `GRAFANA_CLICKHOUSE_PASSWORD` | `grafana` |
 | `GRAFANA_PORT` | `3000` |
 | `OTLP_GRPC_PORT` / `OTLP_HTTP_PORT` | `4317` / `4318` |
-| `GEMINI_DIR` | `~/.gemini` |
+| `AGY_CLI_DIR` | `~/.gemini/antigravity-cli` |
+| `AGY_APP_DIR` | `~/.gemini/antigravity` |
+| `COMPOSE_FILE` | `docker-compose.yml` (`docker-compose.yml:docker-compose.agy-desktop.yml` to include Desktop) |
+| `AGY_UID` / `AGY_GID` | `1000` / `1000` |
 
 If you change `OTLP_GRPC_PORT`, change the port in `OTEL_EXPORTER_OTLP_ENDPOINT` in your Claude Code settings too.
+
+## Antigravity exporter behavior
+
+- **State & cursors (`/state/state.json`):** `agy-exporter` verifies `/state` is writable before exporting and tracks per-conversation metric and log cursors (`last_metric_gen_idx`, `last_log_gen_idx`, `last_metric_step_idx`, `last_log_step_idx`, `pending_metric_steps`, `pending_log_steps`).
+- **Failure isolation:**
+  - `failed_mtime_ns` (with exponential poll backoff `min(60, 2 ** fail_count)`): a conversation whose SQLite DB fails to parse is logged and skipped without blocking other conversations.
+  - `export_rejected_mtime_ns`: when a batch fails with HTTP `400` or `413`, `agy-exporter` recursively binary-splits the chunk; if a single conversation is permanently rejected with `400`, it records `export_rejected_mtime_ns` and skips that conversation until its file `mtime` changes, while committing cursors for all accepted chunks.
+  - Transient OTLP errors (`429`, `5xx`, connection failures) leave cursors for the failed stream untouched so they retry on the next poll.
+- **Abandoned in-flight steps:** Steps in `status in (0, 1, 2, 9)` are held in `pending_*_steps` only while within `IN_FLIGHT_STEP_GRACE_SEC` (120 s) on a live WAL; once 120 s elapses, they are emitted as `agy.tool_result` with `success="false"` and `error_type="abandoned"` and removed from `pending_*_steps`.
 
 ## Query with SQL
 

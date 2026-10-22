@@ -1,0 +1,21 @@
+services:
+  agy-exporter:
+    volumes:
+      - type: bind
+        source: ${AGY_APP_DIR:-~/.gemini/antigravity}/conversations
+        target: /gemini/antigravity/conversations
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AGY_APP_DIR:-~/.gemini/antigravity}/brain
+        target: /gemini/antigravity/brain
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AGY_APP_DIR:-~/.gemini/antigravity}/conversation_summaries.db
+        target: /gemini/antigravity/conversation_summaries.db
+        read_only: true
+        bind:
+          create_host_path: false

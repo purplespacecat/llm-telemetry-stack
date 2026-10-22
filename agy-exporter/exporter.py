@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Antigravity (agy) OpenTelemetry Exporter Sidecar.
 
-Reads local Antigravity conversation databases and transcripts from ~/.gemini
-(both antigravity-cli and antigravity desktop) and exports OpenTelemetry
+Reads local Antigravity conversation databases and transcripts from mounted
+subtrees (antigravity-cli and antigravity desktop) and exports OpenTelemetry
 metrics and logs via OTLP/HTTP JSON to the OpenTelemetry Collector.
 
 Reverse-engineered protobuf schema notes (Antigravity / Cortex SQLite store):
@@ -23,7 +23,7 @@ Reverse-engineered protobuf schema notes (Antigravity / Cortex SQLite store):
     - field 11 (google.protobuf.Duration): total generation duration
     - field 12 (google.protobuf.Duration): time to first token (TTFT)
     - field 19 (string): model ID slug (e.g. `gemini-pro-default`)
-    - field 20 (repeated KeyValue): metadata map (`last_step_index`, `request_id`, etc.)
+    - field 20 (repeated KeyValue): metadata map (`last_step_index`, `request_id`, `root_cascade_id`, `cascade_id`)
     - field 21 (string): human-readable model display name (e.g. `Gemini 4 Argon (Medium)`)
   - field 2 (packed repeated varint): step indices produced by this generation
 - `steps` table:
@@ -52,6 +52,7 @@ import re
 import shutil
 import sqlite3
 import struct
+import sys
 import tempfile
 import time
 import traceback
@@ -65,6 +66,8 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "/state/state.json"))
 OTLP_HTTP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318").rstrip("/")
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "5"))
 IN_FLIGHT_STEP_GRACE_SEC = 120.0
+MAX_BATCH_BYTES = 4 * 1024 * 1024
+SINGLE_CONV_SPLIT_BYTES = 450 * 1024
 
 # API list prices in USD per 1M tokens: (input_per_1m, cache_read_per_1m, output_per_1m)
 MODEL_PRICING: list[tuple[str, tuple[float, float, float]]] = [
@@ -81,10 +84,11 @@ DEFAULT_PRICING = (1.25, 0.3125, 10.00)
 
 SKILL_PATH_RE = re.compile(r"/skills/([^/]+)/SKILL\.md")
 EXIT_CODE_RE = re.compile(r"(?:Command exited with code|command failed with exit code:?)\s+(\d+)", re.IGNORECASE)
+# Case-sensitive uppercase group for status identifier so lowercase prose (e.g. 'overloaded') never matches group 2
 API_ERROR_RE = re.compile(
-    r"API error(?:\s*\(attempt\s*(\d+)\))?:\s*([A-Z_]+)?(?:\s*\(code\s*(\d+)\))?:\s*(.*)",
-    re.IGNORECASE,
+    r"[Aa][Pp][Ii]\s+[Ee]rror(?:\s*\(attempt\s*(\d+)\))?:\s*([A-Z][A-Z0-9_]+)(?:\s*\(code\s*(\d+)\))?(?::\s*(.*))?"
 )
+API_ATTEMPT_RE = re.compile(r"[Aa][Pp][Ii]\s+[Ee]rror(?:\s*\(attempt\s*(\d+)\))?")
 
 
 def first_line(text: Any) -> str:
@@ -99,7 +103,7 @@ def first_line(text: Any) -> str:
 
 def parse_wire(buf: bytes | None) -> dict[int, list[Any]]:
     """Minimal protobuf wire format decoder using only the standard library."""
-    if not buf:
+    if not isinstance(buf, (bytes, bytearray, memoryview)) or not buf:
         return {}
     i, n = 0, len(buf)
     fields: dict[int, list[Any]] = {}
@@ -135,7 +139,7 @@ def parse_wire(buf: bytes | None) -> dict[int, list[Any]]:
                 shift += 7
             if i + ln > n:
                 break
-            val = buf[i : i + ln]
+            val = bytes(buf[i : i + ln])
             i += ln
         elif wt == 5:
             if i + 4 > n:
@@ -153,7 +157,46 @@ def parse_wire(buf: bytes | None) -> dict[int, list[Any]]:
     return fields
 
 
+def wire_bytes(fields: dict[int, list[Any]], fn: int) -> bytes:
+    """Return the first length-delimited bytes value for field `fn`, or b'' if absent or wrong wire type."""
+    for v in fields.get(fn, ()):
+        if isinstance(v, bytes):
+            return v
+    return b""
+
+
+def wire_bytes_list(fields: dict[int, list[Any]], fn: int) -> list[bytes]:
+    """Return all length-delimited bytes values for field `fn`."""
+    return [v for v in fields.get(fn, ()) if isinstance(v, bytes)]
+
+
+def wire_str(fields: dict[int, list[Any]], fn: int) -> str:
+    """Return the first length-delimited string value for field `fn`, or ''."""
+    b = wire_bytes(fields, fn)
+    return b.decode("utf-8", errors="replace") if b else ""
+
+
+def wire_int(fields: dict[int, list[Any]], fn: int, default: int = 0) -> int:
+    """Return the first integer varint value for field `fn`, or `default`."""
+    for v in fields.get(fn, ()):
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return default
+
+
+def wire_msg(fields: dict[int, list[Any]], fn: int) -> dict[int, list[Any]]:
+    """Decode the first embedded message at field `fn`."""
+    return parse_wire(wire_bytes(fields, fn))
+
+
+def wire_msg_list(fields: dict[int, list[Any]], fn: int) -> list[dict[int, list[Any]]]:
+    """Decode all repeated embedded messages at field `fn`."""
+    return [parse_wire(b) for b in wire_bytes_list(fields, fn)]
+
+
 def parse_packed_varints(buf: bytes) -> list[int]:
+    if not isinstance(buf, (bytes, bytearray)) or not buf:
+        return []
     i, n = 0, len(buf)
     out: list[int] = []
     while i < n:
@@ -169,24 +212,18 @@ def parse_packed_varints(buf: bytes) -> list[int]:
     return out
 
 
-def proto_ts_ns(buf: bytes | None) -> int:
-    if not buf:
+def proto_ts_ns(msg: dict[int, list[Any]]) -> int:
+    sec = wire_int(msg, 1, 0)
+    nanos = wire_int(msg, 2, 0)
+    if sec <= 0:
         return 0
-    f = parse_wire(buf)
-    sec = f.get(1, [0])[0]
-    nanos = f.get(2, [0])[0]
-    if not isinstance(sec, int) or sec <= 0:
-        return 0
-    return sec * 1_000_000_000 + (nanos if isinstance(nanos, int) else 0)
+    return sec * 1_000_000_000 + max(0, nanos)
 
 
-def proto_duration_ms(buf: bytes | None) -> float:
-    if not buf:
-        return 0.0
-    f = parse_wire(buf)
-    sec = f.get(1, [0])[0]
-    nanos = f.get(2, [0])[0]
-    return (sec if isinstance(sec, int) else 0) * 1000.0 + (nanos if isinstance(nanos, int) else 0) / 1_000_000.0
+def proto_duration_ms(msg: dict[int, list[Any]]) -> float:
+    sec = wire_int(msg, 1, 0)
+    nanos = wire_int(msg, 2, 0)
+    return sec * 1000.0 + nanos / 1_000_000.0
 
 
 def estimate_cost_usd(model: str, input_tokens: int, cache_read_tokens: int, output_tokens: int) -> float:
@@ -213,6 +250,19 @@ def classify_skill_source(path_str: str) -> str:
     return "workspace"
 
 
+def extract_activated_skill(tname: str, args_dict: dict[str, Any], success: bool) -> tuple[str, str] | None:
+    """Single source of truth for skill activation detection across cost tagging and log events."""
+    if not success or tname not in ("read_file", "view_file"):
+        return None
+    path_arg = str(args_dict.get("Path") or args_dict.get("AbsolutePath") or "")
+    if not path_arg:
+        return None
+    sm = SKILL_PATH_RE.search(path_arg)
+    if not sm:
+        return None
+    return sm.group(1), classify_skill_source(path_arg)
+
+
 def classify_error_type(err_msg: str, exit_code: int | None = None) -> str:
     if exit_code is not None and exit_code != 0:
         return f"ExitCode_{exit_code}"
@@ -234,6 +284,40 @@ def classify_error_type(err_msg: str, exit_code: int | None = None) -> str:
     if "failed to resolve subagent" in low:
         return "SubagentConfigError"
     return "ToolError"
+
+
+def classify_api_error(raw: str) -> dict[str, str]:
+    """Classify an Antigravity API/model error string into {attempt, status_code, error}."""
+    m_att = API_ATTEMPT_RE.search(raw)
+    attempt = (m_att.group(1) if m_att and m_att.group(1) else None) or "1"
+
+    m_api = API_ERROR_RE.search(raw)
+    if m_api:
+        grpc_status = m_api.group(2)
+        http_code = m_api.group(3)
+        return {
+            "attempt": m_api.group(1) or attempt,
+            "status_code": http_code or grpc_status,
+            "error": grpc_status,
+        }
+
+    low = raw.lower()
+    if "timed out" in low or "timeout" in low or "deadline exceeded" in low:
+        return {"attempt": attempt, "status_code": "timeout", "error": "Timeout"}
+    if "invalid_args" in low or "invalid tool call" in low or "problem parsing the tool call" in low:
+        return {"attempt": attempt, "status_code": "invalid_args", "error": "Invalid tool call arguments"}
+    if "model output error" in low or "output text or tool calls" in low:
+        return {"attempt": attempt, "status_code": "empty_output", "error": "Empty model output"}
+    if "context canceled" in low or "cancelled" in low or "canceled" in low:
+        return {"attempt": attempt, "status_code": "canceled", "error": "Canceled"}
+    if m_att:
+        m_code = re.search(r"\(code\s*(\d+)\)", raw)
+        return {
+            "attempt": attempt,
+            "status_code": m_code.group(1) if m_code else "500",
+            "error": "APIError",
+        }
+    return {"attempt": attempt, "status_code": "error", "error": "Execution error"}
 
 
 def otlp_kv(attrs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -275,7 +359,13 @@ def make_log_record(ts_ns: int, event_name: str, attrs: dict[str, Any], body: st
     }
 
 
-def post_otlp(path: str, payload: dict[str, Any]) -> bool:
+def post_otlp(path: str, payload: dict[str, Any]) -> tuple[bool, bool]:
+    """Send OTLP/HTTP JSON payload and return (ok, retryable).
+
+    Per the OTLP spec, HTTP 2xx with `partialSuccess` means the collector accepted
+    the valid portion of the batch and the client MUST NOT retry it; we log the
+    rejected counts and return (True, False) so cursors advance.
+    """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{OTLP_HTTP_ENDPOINT}{path}",
@@ -285,38 +375,102 @@ def post_otlp(path: str, payload: dict[str, Any]) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
+            raw_body = resp.read()
+            if not (200 <= resp.status < 300):
+                retryable = resp.status in (429, 500, 502, 503, 504)
+                return False, retryable
+            if raw_body:
+                try:
+                    body_json = json.loads(raw_body.decode("utf-8", errors="replace"))
+                    if isinstance(body_json, dict):
+                        ps = body_json.get("partialSuccess")
+                        if isinstance(ps, dict):
+                            rejected_pts = int(ps.get("rejectedDataPoints") or 0)
+                            rejected_logs = int(ps.get("rejectedLogRecords") or 0)
+                            err_msg = str(ps.get("errorMessage") or "").strip()
+                            if rejected_pts > 0 or rejected_logs > 0 or err_msg:
+                                print(
+                                    f"[agy-exporter] OTLP partialSuccess on {path}: "
+                                    f"rejectedDataPoints={rejected_pts}, rejectedLogRecords={rejected_logs}, "
+                                    f"errorMessage={err_msg!r}",
+                                    flush=True,
+                                )
+                except Exception as parse_exc:
+                    print(f"[agy-exporter] Malformed OTLP 2xx response on {path}: {parse_exc}", flush=True)
+            return True, False
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        retryable = exc.code in (429, 500, 502, 503, 504)
+        print(
+            f"[agy-exporter] HTTP {exc.code} POST {path} (retryable={retryable}): {err_body or exc.reason}",
+            flush=True,
+        )
+        return False, retryable
     except Exception as exc:
         print(f"[agy-exporter] Failed POST {path}: {exc}", flush=True)
-        return False
+        return False, True
 
 
-def copy_sqlite_with_wal(src_db: Path, dst_db: Path) -> None:
-    """Copy a SQLite database and its -wal journal (excluding -shm so SQLite rebuilds it cleanly)."""
-    shutil.copy2(src_db, dst_db)
-    src_wal = Path(str(src_db) + "-wal")
-    dst_wal = Path(str(dst_db) + "-wal")
-    dst_shm = Path(str(dst_db) + "-shm")
-    if dst_shm.exists():
-        dst_shm.unlink()
-    if src_wal.exists():
-        shutil.copy2(src_wal, dst_wal)
-    elif dst_wal.exists():
-        dst_wal.unlink()
+def snapshot_sqlite_to_memory(db_path: Path, tmp_dir: Path) -> sqlite3.Connection:
+    """Atomically snapshot a SQLite database into an in-memory connection using sqlite3.backup().
 
-
-def cleanup_sqlite_copy(dst_db: Path) -> None:
-    for suffix in ("", "-wal", "-shm"):
-        p = Path(str(dst_db) + suffix)
-        if p.exists():
+    Tries `mode=ro` first (which atomically reads active WAL + SHM pages via SQLite locks),
+    falls back to `immutable=1` when no `-wal` exists on a read-only directory, and falls back
+    to a temporary file copy only if an uncheckpointed `-wal` exists without `-shm` on a `:ro` mount.
+    """
+    dst = sqlite3.connect(":memory:")
+    wal_path = Path(str(db_path) + "-wal")
+    try:
+        src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            src.backup(dst)
+            return dst
+        finally:
+            src.close()
+    except sqlite3.Error:
+        if not wal_path.exists():
             try:
-                p.unlink()
-            except OSError:
-                pass
+                src = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+                try:
+                    src.backup(dst)
+                    return dst
+                finally:
+                    src.close()
+            except Exception:
+                dst.close()
+                raise
+
+    # Fallback for crashed WAL without -shm on a read-only directory
+    tmp_db = tmp_dir / f"snap_{os.getpid()}_{db_path.name}"
+    tmp_wal = Path(str(tmp_db) + "-wal")
+    try:
+        shutil.copy2(db_path, tmp_db)
+        if wal_path.exists():
+            shutil.copy2(wal_path, tmp_wal)
+        src = sqlite3.connect(str(tmp_db))
+        try:
+            src.backup(dst)
+            return dst
+        finally:
+            src.close()
+    except Exception:
+        dst.close()
+        raise
+    finally:
+        for p in (tmp_db, tmp_wal, Path(str(tmp_db) + "-shm")):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
 
 class SummaryCache:
-    """Caches conversation_summaries.db per surface, reloading only when mtime changes."""
+    """Caches conversation_summaries.db per surface if present, reloading only when mtime changes."""
 
     def __init__(self) -> None:
         self._mtimes: dict[str, int] = {}
@@ -335,11 +489,9 @@ class SummaryCache:
         if self._mtimes.get(key) == mtime and key in self._data:
             return self._data[key]
 
-        dst = tmp_dir / f"summaries_{surface_dir.name}.db"
         summaries: dict[str, dict[str, Any]] = {}
         try:
-            copy_sqlite_with_wal(db_file, dst)
-            conn = sqlite3.connect(str(dst))
+            conn = snapshot_sqlite_to_memory(db_file, tmp_dir)
             try:
                 rows = conn.execute(
                     "SELECT conversation_id, workspace_uris, agent_name, parent_conversation_id, nesting_depth "
@@ -366,12 +518,11 @@ class SummaryCache:
             self._data[key] = summaries
         except Exception as exc:
             print(f"[agy-exporter] Error reading {db_file}: {exc}", flush=True)
-        finally:
-            cleanup_sqlite_copy(dst)
         return self._data.get(key, {})
 
 
 SUMMARY_CACHE = SummaryCache()
+_WARNED_MISSING_SURFACES: set[str] = set()
 
 
 def load_transcript_map(surface_dir: Path, cid: str, min_step_idx: int = 0) -> dict[int, dict[str, Any]]:
@@ -412,19 +563,9 @@ def process_conversation_db(
     dict[str, Any],
     bool,
 ]:
-    """Extract new generation and step telemetry for a single conversation.
-
-    Returns:
-        gen_metrics: metrics derived from `gen_metadata` (committed with `last_gen_idx`)
-        step_metrics: metrics derived from `steps` (committed with `last_step_idx`)
-        step_logs: log records derived from `gen_metadata` and `steps`
-        next_state: updated conversation cursor dictionary
-        has_in_flight: True if a trailing step is still running so mtime should be re-checked
-    """
+    """Extract new generation and step telemetry for a single conversation."""
     cid = db_path.stem
-    dst = tmp_dir / f"{surface}_{cid}.db"
-    copy_sqlite_with_wal(db_path, dst)
-
+    has_live_wal = Path(str(db_path) + "-wal").exists()
     gen_metrics: dict[str, list[dict[str, Any]]] = {}
     step_metrics: dict[str, list[dict[str, Any]]] = {}
     gen_logs: list[dict[str, Any]] = []
@@ -437,7 +578,7 @@ def process_conversation_db(
     def add_step_metric(name: str, ts_ns: int, val: float, attrs: dict[str, Any]) -> None:
         step_metrics.setdefault(name, []).append(make_dp(ts_ns, val, attrs))
 
-    conn = sqlite3.connect(str(dst))
+    conn = snapshot_sqlite_to_memory(db_path, tmp_dir)
     try:
         # 1. Extract repository and branch from trajectory_metadata_blob
         repo = summary_info.get("repository", "")
@@ -446,21 +587,28 @@ def process_conversation_db(
         row = conn.execute("SELECT data FROM trajectory_metadata_blob LIMIT 1").fetchone()
         if row and row[0]:
             tm = parse_wire(row[0])
-            traj_created_ns = proto_ts_ns(tm.get(2, [b""])[0])
-            ws_info = parse_wire(tm.get(1, [b""])[0])
-            git_info = parse_wire(ws_info.get(3, [b""])[0])
-            git_repo = git_info.get(1, [b""])[0].decode("utf-8", errors="replace")
+            traj_created_ns = proto_ts_ns(wire_msg(tm, 2))
+            ws_info = wire_msg(tm, 1)
+            git_info = wire_msg(ws_info, 3)
+            git_repo = wire_str(git_info, 1)
             if git_repo:
                 repo = git_repo
             elif not repo:
-                ws_uri = ws_info.get(1, [b""])[0].decode("utf-8", errors="replace").replace("file://", "").rstrip("/")
+                ws_uri = wire_str(ws_info, 1).replace("file://", "").rstrip("/")
                 if ws_uri:
                     repo = os.path.basename(ws_uri)
-            branch = ws_info.get(4, [b""])[0].decode("utf-8", errors="replace")
+            branch = wire_str(ws_info, 4)
 
-        nesting_depth = summary_info.get("nesting_depth", 0)
+        has_parent = False
+        try:
+            p_cnt = conn.execute("SELECT count() FROM parent_references").fetchone()[0]
+            has_parent = bool(p_cnt and p_cnt > 0)
+        except sqlite3.Error:
+            pass
+
+        nesting_depth = int(summary_info.get("nesting_depth", 0) or (1 if has_parent else 0))
         query_source = "subagent" if nesting_depth > 0 else "main"
-        agent_name = summary_info.get("agent_name", "")
+        agent_name = str(summary_info.get("agent_name", ""))
 
         base_attrs = {
             "session.id": cid,
@@ -471,20 +619,24 @@ def process_conversation_db(
             "agent.name": agent_name,
         }
 
-        last_metric_gen_idx = int(conv_state.get("last_metric_gen_idx", conv_state.get("last_gen_idx", -1)))
-        last_log_gen_idx = int(conv_state.get("last_log_gen_idx", conv_state.get("last_gen_idx", -1)))
-        last_metric_step_idx = int(conv_state.get("last_metric_step_idx", conv_state.get("last_step_idx", -1)))
-        last_log_step_idx = int(conv_state.get("last_log_step_idx", conv_state.get("last_step_idx", -1)))
-        pending_metric_steps: set[int] = {int(x) for x in conv_state.get("pending_metric_steps", conv_state.get("pending_steps", []))}
-        pending_log_steps: set[int] = {int(x) for x in conv_state.get("pending_log_steps", conv_state.get("pending_steps", []))}
+        last_metric_gen_idx = int(conv_state.get("last_metric_gen_idx", -1))
+        last_log_gen_idx = int(conv_state.get("last_log_gen_idx", -1))
+        pending_metric_gens: set[int] = {int(x) for x in conv_state.get("pending_metric_gens", [])}
+        pending_log_gens: set[int] = {int(x) for x in conv_state.get("pending_log_gens", [])}
 
-        min_gen_idx = min(last_metric_gen_idx, last_log_gen_idx)
+        last_metric_step_idx = int(conv_state.get("last_metric_step_idx", -1))
+        last_log_step_idx = int(conv_state.get("last_log_step_idx", -1))
+        pending_metric_steps: set[int] = {int(x) for x in conv_state.get("pending_metric_steps", [])}
+        pending_log_steps: set[int] = {int(x) for x in conv_state.get("pending_log_steps", [])}
+
+        min_gen_idx = min([last_metric_gen_idx, last_log_gen_idx] + [g - 1 for g in (pending_metric_gens | pending_log_gens)])
         min_step_idx = min(last_metric_step_idx, last_log_step_idx)
         all_pending_steps = pending_metric_steps | pending_log_steps
+        all_pending_gens = pending_metric_gens | pending_log_gens
 
         max_db_gen = conn.execute("SELECT coalesce(max(idx), -1) FROM gen_metadata").fetchone()[0]
         max_db_step = conn.execute("SELECT coalesce(max(idx), -1) FROM steps").fetchone()[0]
-        if max_db_gen <= min_gen_idx and max_db_step <= min_step_idx and not all_pending_steps:
+        if max_db_gen <= min_gen_idx and max_db_step <= min_step_idx and not all_pending_steps and not all_pending_gens:
             return gen_metrics, step_metrics, [], conv_state, False
 
         # Load steps and parse wire metadata once per step
@@ -495,60 +647,135 @@ def process_conversation_db(
         min_needed_step = min([min_step_idx + 1] + list(all_pending_steps)) if all_pending_steps else (min_step_idx + 1)
         transcript_steps = load_transcript_map(surface_dir, cid, min_step_idx=max(0, min_needed_step))
 
-        parsed_steps: list[tuple[int, int, int, dict[int, list[Any]], bytes | None, bytes | None, str, str]] = []
+        parsed_steps: list[
+            tuple[
+                int,
+                int,
+                int,
+                dict[int, list[Any]],
+                bytes | None,
+                bytes | None,
+                str,
+                dict[str, Any],
+                str,
+                str,
+                bool,
+                int | None,
+                tuple[str, str] | None,
+            ]
+        ] = []
         step_ts_map: dict[int, int] = {}
         step_status_map: dict[int, int] = {}
         active_skill_by_step: dict[int, str] = {}
         active_mcp_by_step: dict[int, str] = {}
-        current_skill = conv_state.get("active_skill", "")
-        current_model = conv_state.get("current_model", "auto")
-        last_slash_skill = ""
+        slash_by_step: dict[int, str] = {}
+        model_by_step: dict[int, str] = {}
+        query_source_by_step: dict[int, str] = {}
+
+        current_skill = ""
+        current_model = "auto"
+        current_turn_slash = ""
 
         for idx, stype, status, meta_blob, perm_blob, err_blob in step_rows:
             m = parse_wire(meta_blob)
-            t_created = proto_ts_ns(m.get(1, [b""])[0])
+            t_created = proto_ts_ns(wire_msg(m, 1))
             if t_created > 0:
                 step_ts_map[idx] = t_created
             step_status_map[idx] = status
 
             t_step = transcript_steps.get(idx, {})
-            content_str = t_step.get("content") or ""
-            if stype == 14 and content_str:
-                m_change = re.search(r"changed setting `Model Selection` from .* to ([^.\n]+)\.", content_str)
-                if m_change:
-                    current_model = m_change.group(1).strip()
-                m_req = re.search(r"<USER_REQUEST>\s*/([a-zA-Z0-9_-]+)", content_str)
-                if m_req:
-                    last_slash_skill = m_req.group(1).strip()
+            t_content = str(t_step.get("content") or "")
+            t_err = str(t_step.get("error") or "")
 
-            tc = parse_wire(m.get(4, [b""])[0])
-            tname = tc.get(2, [b""])[0].decode("utf-8", errors="replace")
-            targs_raw = tc.get(3, [b""])[0].decode("utf-8", errors="replace")
-            if tname in ("read_file", "view_file") and "SKILL.md" in targs_raw:
-                sm = SKILL_PATH_RE.search(targs_raw)
-                if sm:
-                    current_skill = sm.group(1)
-            if tname == "call_mcp_tool":
+            if stype == 14:
+                current_turn_slash = ""
+                if t_content:
+                    m_change = re.search(r"changed setting `Model Selection` from .* to ([^.\n]+)\.", t_content)
+                    if m_change:
+                        current_model = m_change.group(1).strip()
+                    m_req = re.search(r"<USER_REQUEST>\s*/([a-zA-Z0-9_-]+)", t_content)
+                    if m_req:
+                        current_turn_slash = m_req.group(1).strip()
+
+            tc = wire_msg(m, 4)
+            tname = wire_str(tc, 2)
+            targs_raw = wire_str(tc, 3)
+            args_dict: dict[str, Any] = {}
+            if targs_raw:
                 try:
-                    parsed_args = json.loads(targs_raw)
-                    srv = parsed_args.get("ServerName", "")
-                    if srv:
-                        active_mcp_by_step[idx] = srv
+                    parsed = json.loads(targs_raw)
+                    if isinstance(parsed, dict):
+                        args_dict = parsed
                 except Exception:
                     pass
+
+            err_msg = ""
+            if err_blob:
+                ef = parse_wire(err_blob)
+                err_msg = first_line(wire_str(ef, 1) or wire_str(ef, 2))
+            if not err_msg and t_err:
+                err_msg = first_line(t_err)
+
+            exit_code: int | None = None
+            if t_content:
+                m_exit = EXIT_CODE_RE.search(t_content)
+                if m_exit:
+                    exit_code = int(m_exit.group(1))
+
+            success = (status == 3 and stype not in (17, 23)) and not err_msg and (exit_code is None or exit_code == 0)
+            activated_skill = extract_activated_skill(tname, args_dict, success)
+            if activated_skill is not None:
+                current_skill = activated_skill[0]
+
+            if tname == "call_mcp_tool":
+                srv = str(args_dict.get("ServerName") or "")
+                if srv:
+                    active_mcp_by_step[idx] = srv
             elif tname.startswith("mcp_"):
                 parts = tname.split("_")
                 if len(parts) >= 3:
                     active_mcp_by_step[idx] = parts[1]
-            active_skill_by_step[idx] = current_skill
-            parsed_steps.append((idx, stype, status, m, perm_blob, err_blob, tname, targs_raw))
 
-        conv_state["active_skill"] = current_skill
-        conv_state["current_model"] = current_model
+            active_skill_by_step[idx] = current_skill
+            slash_by_step[idx] = current_turn_slash
+            model_by_step[idx] = current_model
+            parsed_steps.append(
+                (
+                    idx,
+                    stype,
+                    status,
+                    m,
+                    perm_blob,
+                    err_blob,
+                    tname,
+                    args_dict,
+                    t_content,
+                    err_msg,
+                    success,
+                    exit_code,
+                    activated_skill,
+                )
+            )
+
+        now_ns = int(time.time() * 1e9)
+        first_ts = step_ts_map.get(0) or step_ts_map.get(1) or traj_created_ns or now_ns
+
+        # If a brand-new conversation (< IN_FLIGHT_STEP_GRACE_SEC old) has no row in conversation_summaries.db yet
+        # (first poll raced summary creation), treat it as in-flight and wait one poll before emitting session.count
+        # so agent.name / nesting_depth are not permanently blanked.
+        if (
+            has_live_wal
+            and not conv_state.get("session_counted")
+            and not summary_info
+            and (surface_dir / "conversation_summaries.db").exists()
+            and (now_ns - first_ts) / 1e9 < IN_FLIGHT_STEP_GRACE_SEC
+            and not conv_state.get("summary_grace_waited")
+        ):
+            conv_state["summary_grace_waited"] = True
+            return gen_metrics, step_metrics, [], conv_state, True
 
         # Emit session count once per conversation
         if not conv_state.get("session_counted"):
-            first_ts = step_ts_map.get(0) or step_ts_map.get(1) or traj_created_ns or int(time.time() * 1e9)
             add_gen_metric("agy.session.count", first_ts, 1.0, base_attrs)
             conv_state["session_counted"] = True
 
@@ -557,31 +784,36 @@ def process_conversation_db(
             "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx ASC", (min_gen_idx,)
         ).fetchall()
 
-        now_ns = int(time.time() * 1e9)
+        new_pending_metric_gens: set[int] = set()
+        new_pending_log_gens: set[int] = set()
 
         for g_idx, g_data in gen_rows:
+            need_gen_metric = (g_idx > last_metric_gen_idx) or (g_idx in pending_metric_gens)
+            need_gen_log = (g_idx > last_log_gen_idx) or (g_idx in pending_log_gens)
+            if not need_gen_metric and not need_gen_log:
+                continue
+
             f = parse_wire(g_data)
-            step_indices = parse_packed_varints(f.get(2, [b""])[0])
+            step_indices = parse_packed_varints(wire_bytes(f, 2))
             first_step_idx: int | None = step_indices[0] if step_indices else None
 
-            # Guard against in-flight generation race: if the planner step is still in-flight, wait for next poll
-            if first_step_idx is not None and step_status_map.get(first_step_idx) in (0, 1, 2):
-                step_age = (now_ns - step_ts_map.get(first_step_idx, now_ns)) / 1e9
+            # Non-blocking in-flight generation check: only defer if the planner step is actively in-flight
+            # within the grace window; never `break` or block later generations behind an abandoned step.
+            if has_live_wal and first_step_idx is not None and step_status_map.get(first_step_idx) in (0, 1, 2):
+                ref_gen_ts = step_ts_map.get(first_step_idx) or max(step_ts_map.values(), default=0) or traj_created_ns or now_ns
+                step_age = (now_ns - ref_gen_ts) / 1e9
                 if step_age < IN_FLIGHT_STEP_GRACE_SEC:
                     has_in_flight = True
-                break
+                    if need_gen_metric:
+                        new_pending_metric_gens.add(g_idx)
+                    if need_gen_log:
+                        new_pending_log_gens.add(g_idx)
+                    last_metric_gen_idx = max(last_metric_gen_idx, g_idx)
+                    last_log_gen_idx = max(last_log_gen_idx, g_idx)
+                    continue
 
-            need_gen_metric = g_idx > last_metric_gen_idx
-            need_gen_log = g_idx > last_log_gen_idx
-
-            for m1 in f.get(1, []):
-                gm = parse_wire(m1)
-                kv = {
-                    parse_wire(x).get(1, [b""])[0].decode("utf-8", errors="replace"): parse_wire(x)
-                    .get(2, [b""])[0]
-                    .decode("utf-8", errors="replace")
-                    for x in gm.get(20, [])
-                }
+            for gm in wire_msg_list(f, 1):
+                kv = {wire_str(x, 1): wire_str(x, 2) for x in wire_msg_list(gm, 20)}
                 if first_step_idx is None and "last_step_index" in kv:
                     try:
                         first_step_idx = int(kv["last_step_index"]) + 1
@@ -590,18 +822,28 @@ def process_conversation_db(
 
                 resolved_step_idx = first_step_idx if first_step_idx is not None else 0
 
-                model_display = gm.get(21, [b""])[0].decode("utf-8", errors="replace")
-                model_slug = gm.get(19, [b""])[0].decode("utf-8", errors="replace")
-                model_name = model_display or model_slug or current_model or "unknown"
+                model_display = wire_str(gm, 21)
+                model_slug = wire_str(gm, 19)
+                model_name = model_display or model_slug or model_by_step.get(resolved_step_idx, "auto") or "unknown"
 
-                usage = parse_wire(gm.get(4, [b""])[0])
-                in_tok = int(usage.get(2, [0])[0] or 0)
-                out_tok = int(usage.get(3, [0])[0] or 0)
-                cache_tok = int(usage.get(5, [0])[0] or 0)
-                think_tok = int(usage.get(9, [0])[0] or 0)
+                # Propagate generation's model to its step range for accurate step/error attribution
+                for s_i in step_indices or [resolved_step_idx]:
+                    model_by_step[s_i] = model_name
 
-                dur_ms = proto_duration_ms(gm.get(11, [b""])[0])
-                ttft_ms = proto_duration_ms(gm.get(12, [b""])[0])
+                root_cid = kv.get("root_cascade_id", "")
+                casc_id = kv.get("cascade_id", "")
+                turn_source = "subagent" if (root_cid and casc_id and root_cid != casc_id) else query_source
+                for s_i in step_indices or [resolved_step_idx]:
+                    query_source_by_step[s_i] = turn_source
+
+                usage = wire_msg(gm, 4)
+                in_tok = wire_int(usage, 2, 0)
+                out_tok = wire_int(usage, 3, 0)
+                cache_tok = wire_int(usage, 5, 0)
+                think_tok = wire_int(usage, 9, 0)
+
+                dur_ms = proto_duration_ms(wire_msg(gm, 11))
+                ttft_ms = proto_duration_ms(wire_msg(gm, 12))
 
                 ts_ns = step_ts_map.get(resolved_step_idx) or traj_created_ns or now_ns
                 skill_for_turn = active_skill_by_step.get(resolved_step_idx, "")
@@ -613,6 +855,7 @@ def process_conversation_db(
 
                 turn_attrs = {
                     **base_attrs,
+                    "query_source": turn_source,
                     "model": model_name,
                     "skill.name": skill_for_turn,
                     "mcp_server.name": mcp_for_turn,
@@ -631,7 +874,7 @@ def process_conversation_db(
                         add_gen_metric("agy.token.usage", ts_ns, float(out_tok), {**turn_attrs, "type": "output"})
 
                     if dur_ms > 0:
-                        add_gen_metric("agy.active_time.total", ts_ns, dur_ms / 1000.0, {**base_attrs, "type": "cli"})
+                        add_gen_metric("agy.active_time.total", ts_ns, dur_ms / 1000.0, {**turn_attrs, "type": "cli"})
 
                 if need_gen_log:
                     gen_logs.append(
@@ -654,48 +897,64 @@ def process_conversation_db(
 
         conv_state["last_metric_gen_idx"] = last_metric_gen_idx
         conv_state["last_log_gen_idx"] = last_log_gen_idx
-        conv_state["last_gen_idx"] = min(last_metric_gen_idx, last_log_gen_idx)
+        conv_state["pending_metric_gens"] = sorted(new_pending_metric_gens)
+        conv_state["pending_log_gens"] = sorted(new_pending_log_gens)
 
         # 3. Process steps (Tools, Skills, Permissions, Subagents, LOC/Commits/PRs, Errors)
         new_pending_metric_steps: set[int] = set()
         new_pending_log_steps: set[int] = set()
 
-        for idx, stype, status, m, perm_blob, err_blob, tname, targs_raw in parsed_steps:
+        last_known_model = "auto"
+        last_known_query_source = query_source
+        last_step_ts = traj_created_ns
+        for idx, stype, status, m, perm_blob, err_blob, tname, args_dict, t_content, err_msg, success, exit_code, activated_skill in parsed_steps:
+            step_model = model_by_step.get(idx, last_known_model)
+            if step_model and step_model != "auto":
+                last_known_model = step_model
+            else:
+                step_model = last_known_model
+
+            if stype == 14 and idx not in query_source_by_step:
+                last_known_query_source = query_source
+            step_query_source = query_source_by_step.get(idx, last_known_query_source)
+            last_known_query_source = step_query_source
+            step_attrs = {**base_attrs, "query_source": step_query_source}
+
+            t_created = proto_ts_ns(wire_msg(m, 1))
+            if t_created > 0:
+                last_step_ts = t_created
+
             need_step_metric = (idx > last_metric_step_idx) or (idx in pending_metric_steps)
             need_step_log = (idx > last_log_step_idx) or (idx in pending_log_steps)
             if not need_step_metric and not need_step_log:
                 continue
 
-            t_created = proto_ts_ns(m.get(1, [b""])[0])
-            t_started = proto_ts_ns(m.get(6, [b""])[0]) or t_created
-            t_completed = proto_ts_ns(m.get(8, [b""])[0]) or t_started
+            t_started = proto_ts_ns(wire_msg(m, 6)) or t_created
+            t_completed = proto_ts_ns(wire_msg(m, 8)) or t_started
 
-            # If a step is still in-flight (PENDING/RUNNING/WAITING_FOR_USER), do not block subsequent
-            # completed steps (e.g. backgrounded commands). Keep it in pending_*_steps so if it finishes
-            # later (triggering a DB mtime update), it will be exported then; only set has_in_flight
-            # while the step is recent (< IN_FLIGHT_STEP_GRACE_SEC) so old abandoned steps don't poll.
+            # Non-blocking in-flight step check: only keep in pending_*_steps while within grace window.
+            # Once past IN_FLIGHT_STEP_GRACE_SEC (or when no live WAL exists), fall through and emit as abandoned.
             if status in (0, 1, 2, 9):
-                age_sec = (now_ns - (t_created or now_ns)) / 1e9
-                if age_sec < IN_FLIGHT_STEP_GRACE_SEC:
+                ref_step_ts = t_created or last_step_ts or traj_created_ns or now_ns
+                age_sec = (now_ns - ref_step_ts) / 1e9
+                if has_live_wal and age_sec < IN_FLIGHT_STEP_GRACE_SEC:
                     has_in_flight = True
-                if need_step_metric:
-                    new_pending_metric_steps.add(idx)
-                if need_step_log:
-                    new_pending_log_steps.add(idx)
-                last_metric_step_idx = max(last_metric_step_idx, idx)
-                last_log_step_idx = max(last_log_step_idx, idx)
-                continue
+                    if need_step_metric:
+                        new_pending_metric_steps.add(idx)
+                    if need_step_log:
+                        new_pending_log_steps.add(idx)
+                    last_metric_step_idx = max(last_metric_step_idx, idx)
+                    last_log_step_idx = max(last_log_step_idx, idx)
+                    continue
 
             # Check status transitions in field 26: status=9 is waiting on user permission,
             # and the last status=2 is when tool execution actually began after approval.
             t_exec_start = t_started
             t_wait_start = 0
-            for sub in m.get(26, []):
-                s26 = parse_wire(sub)
-                for item in s26.get(1, []):
-                    it = parse_wire(item)
-                    st_code = it.get(1, [0])[0]
-                    st_ts = proto_ts_ns(it.get(2, [b""])[0])
+            for s26 in wire_msg_list(m, 26):
+                for it in wire_msg_list(s26, 1):
+                    st_code = wire_int(it, 1, 0)
+                    st_ts = proto_ts_ns(wire_msg(it, 2))
                     if st_ts <= 0:
                         continue
                     if st_code == 9 and t_wait_start == 0:
@@ -706,29 +965,14 @@ def process_conversation_db(
                         t_completed = st_ts
 
             ts_ns = t_created or traj_created_ns or now_ns
-            dur_ms = max(0.0, (t_completed - t_exec_start) / 1_000_000.0)
-
-            args_dict: dict[str, Any] = {}
-            if targs_raw:
-                try:
-                    parsed = json.loads(targs_raw)
-                    if isinstance(parsed, dict):
-                        args_dict = parsed
-                except Exception:
-                    pass
+            # Guard against zero t_exec_start producing a ~56-year duration when only t_completed is set
+            if t_exec_start > 0 and t_completed >= t_exec_start:
+                dur_ms = (t_completed - t_exec_start) / 1_000_000.0
+            else:
+                dur_ms = 0.0
 
             t_step = transcript_steps.get(idx, {})
-            t_type = t_step.get("type", "")
-            t_content = t_step.get("content") or ""
-            t_err = t_step.get("error") or ""
-
-            err_msg = ""
-            if err_blob:
-                ef = parse_wire(err_blob)
-                raw_bytes = (ef.get(1) or ef.get(2) or [b""])[0]
-                err_msg = first_line(raw_bytes)
-            if not err_msg and t_err:
-                err_msg = first_line(t_err)
+            t_type = str(t_step.get("type") or "")
 
             if not need_step_metric:
                 add_step_metric_fn = lambda *a, **kw: None
@@ -742,34 +986,18 @@ def process_conversation_db(
             # Check for API / Model output errors (ERROR_MESSAGE step)
             if t_type == "ERROR_MESSAGE" or (stype in (17, 23) and (err_msg or "Error" in t_content)):
                 raw_err = err_msg or first_line(t_content) or "Model error"
-                m_api = API_ERROR_RE.search(raw_err)
-                if m_api:
-                    attempt = m_api.group(1) or "1"
-                    status_code = m_api.group(3) or m_api.group(2) or "500"
-                    clean_err = m_api.group(2) or "APIError"
-                elif "invalid_args" in raw_err or "invalid tool call" in raw_err.lower():
-                    attempt = "1"
-                    status_code = "invalid_args"
-                    clean_err = "Invalid tool call arguments"
-                elif "model output error" in raw_err.lower():
-                    attempt = "1"
-                    status_code = "empty_output"
-                    clean_err = "Empty model output"
-                else:
-                    attempt = "1"
-                    status_code = "error"
-                    clean_err = "Execution error"
+                classified = classify_api_error(raw_err)
 
                 emit_step_log(
                     make_log_record(
                         ts_ns,
                         "agy.api_error",
                         {
-                            **base_attrs,
-                            "model": current_model,
-                            "status_code": status_code,
-                            "error": clean_err,
-                            "attempt": attempt,
+                            **step_attrs,
+                            "model": step_model,
+                            "status_code": classified["status_code"],
+                            "error": classified["error"],
+                            "attempt": classified["attempt"],
                             "duration_ms": f"{dur_ms:.1f}",
                         },
                     )
@@ -778,11 +1006,14 @@ def process_conversation_db(
             # Permission decisions
             if perm_blob:
                 pf = parse_wire(perm_blob)
-                for p_item_raw in pf.get(2, []):
-                    p_item = parse_wire(p_item_raw)
-                    accepted_flag = p_item.get(2, [0])[0] == 1
-                    rule_type = p_item.get(3, [0])[0]
-                    scope = p_item.get(5, [b"tool"])[0].decode("utf-8", errors="replace")
+                user_prompted_in_step = False
+                scopes: list[str] = []
+                decisions: list[str] = []
+                sources: list[str] = []
+                for p_item in wire_msg_list(pf, 2):
+                    accepted_flag = wire_int(p_item, 2, 0) == 1
+                    rule_type = wire_int(p_item, 3, 0)
+                    scope = wire_str(p_item, 5) or "tool"
                     if "user denied permission" in err_msg.lower():
                         decision = "reject"
                         perm_source = "user"
@@ -793,25 +1024,41 @@ def process_conversation_db(
                         decision = "accept"
                         perm_source = "config" if rule_type > 0 else "user_prompt"
 
-                    # User prompt wait time counts towards user active time (capped at 60s to exclude away-from-keyboard time)
-                    if perm_source.startswith("user") and t_wait_start > 0 and t_exec_start > t_wait_start:
-                        wait_s = min(60.0, (t_exec_start - t_wait_start) / 1e9)
-                        if wait_s > 0.1:
-                            add_step_metric_fn("agy.active_time.total", ts_ns, wait_s, {**base_attrs, "type": "user"})
+                    if perm_source.startswith("user"):
+                        user_prompted_in_step = True
 
+                    scopes.append(scope)
+                    decisions.append(decision)
+                    sources.append(perm_source)
+
+                if scopes:
+                    step_decision = "reject" if "reject" in decisions else "accept"
+                    if "user" in sources:
+                        step_source = "user"
+                    elif "user_prompt" in sources:
+                        step_source = "user_prompt"
+                    else:
+                        step_source = "config"
+                    joined_scope = ",".join(dict.fromkeys(scopes))
                     emit_step_log(
                         make_log_record(
                             ts_ns,
                             "agy.tool_decision",
                             {
-                                **base_attrs,
-                                "tool_name": tname or scope,
-                                "scope": scope,
-                                "source": perm_source,
-                                "decision": decision,
+                                **step_attrs,
+                                "tool_name": tname or joined_scope,
+                                "scope": joined_scope,
+                                "source": step_source,
+                                "decision": step_decision,
                             },
                         )
                     )
+
+                # Emit user prompt wait time at most once per step (never multiplied by N permission items)
+                if user_prompted_in_step and t_wait_start > 0 and t_exec_start > t_wait_start:
+                    wait_s = min(60.0, (t_exec_start - t_wait_start) / 1e9)
+                    if wait_s > 0.1:
+                        add_step_metric_fn("agy.active_time.total", ts_ns, wait_s, {**step_attrs, "type": "user"})
             elif "permission denied" in err_msg.lower() or "user denied permission" in err_msg.lower():
                 perm_source = "user" if "user denied" in err_msg.lower() else "config"
                 emit_step_log(
@@ -819,7 +1066,7 @@ def process_conversation_db(
                         ts_ns,
                         "agy.tool_decision",
                         {
-                            **base_attrs,
+                            **step_attrs,
                             "tool_name": tname or "unknown",
                             "scope": tname or "tool",
                             "source": perm_source,
@@ -828,23 +1075,20 @@ def process_conversation_db(
                     )
                 )
 
-            # Tool execution results
-            if tname:
-                if dur_ms > 0:
-                    add_step_metric_fn("agy.active_time.total", ts_ns, dur_ms / 1000.0, {**base_attrs, "type": "cli"})
+            # Tool execution results (including abandoned in-flight steps past grace window)
+            is_abandoned = status in (0, 1, 2, 9)
+            if tname or is_abandoned:
+                if dur_ms > 0 and tname:
+                    add_step_metric_fn("agy.active_time.total", ts_ns, dur_ms / 1000.0, {**step_attrs, "type": "cli"})
 
-                exit_code: int | None = None
-                if t_content:
-                    m_exit = EXIT_CODE_RE.search(t_content)
-                    if m_exit:
-                        exit_code = int(m_exit.group(1))
-
-                success = (status == 3 and stype != 17) and not err_msg and (exit_code is None or exit_code == 0)
-                error_type = "" if success else classify_error_type(err_msg or t_content, exit_code)
+                if is_abandoned:
+                    error_type = "abandoned"
+                else:
+                    error_type = "" if success else classify_error_type(err_msg or t_content, exit_code)
 
                 mcp_server_name = ""
                 mcp_tool_name = ""
-                logged_tool_name = tname
+                logged_tool_name = tname or "unknown"
                 if tname == "call_mcp_tool":
                     logged_tool_name = "mcp_tool"
                     mcp_server_name = str(args_dict.get("ServerName") or "")
@@ -861,7 +1105,7 @@ def process_conversation_db(
                         ts_ns,
                         "agy.tool_result",
                         {
-                            **base_attrs,
+                            **step_attrs,
                             "tool_name": logged_tool_name,
                             "mcp_server_name": mcp_server_name,
                             "mcp_tool_name": mcp_tool_name,
@@ -872,30 +1116,27 @@ def process_conversation_db(
                     )
                 )
 
-                # Skill activation detection
-                if tname in ("read_file", "view_file"):
-                    path_arg = str(args_dict.get("Path") or args_dict.get("AbsolutePath") or "")
-                    sm = SKILL_PATH_RE.search(path_arg)
-                    if sm and success:
-                        skill_name = sm.group(1)
-                        skill_source = classify_skill_source(path_arg)
-                        trigger = (
-                            "user-slash"
-                            if (last_slash_skill and last_slash_skill in skill_name)
-                            else "agy-proactive"
+                # Skill activation event using the exact same `activated_skill` tuple as pass 1
+                if activated_skill is not None:
+                    skill_name, skill_source = activated_skill
+                    step_slash = slash_by_step.get(idx, "")
+                    trigger = (
+                        "user-slash"
+                        if (step_slash and step_slash in skill_name)
+                        else "agy-proactive"
+                    )
+                    emit_step_log(
+                        make_log_record(
+                            ts_ns,
+                            "agy.skill_activated",
+                            {
+                                **step_attrs,
+                                "skill.name": skill_name,
+                                "skill.source": skill_source,
+                                "invocation_trigger": trigger,
+                            },
                         )
-                        emit_step_log(
-                            make_log_record(
-                                ts_ns,
-                                "agy.skill_activated",
-                                {
-                                    **base_attrs,
-                                    "skill.name": skill_name,
-                                    "skill.source": skill_source,
-                                    "invocation_trigger": trigger,
-                                },
-                            )
-                        )
+                    )
 
                 # Subagent invocation detection
                 if tname == "invoke_subagent":
@@ -909,7 +1150,7 @@ def process_conversation_db(
                                 ts_ns,
                                 "agy.subagent_invoked",
                                 {
-                                    **base_attrs,
+                                    **step_attrs,
                                     "agent.type": str(item.get("TypeName") or item.get("AgentName") or "self"),
                                     "agent.role": str(item.get("Role") or "subagent"),
                                     "model": str(item.get("Model") or "inherit"),
@@ -928,7 +1169,7 @@ def process_conversation_db(
                         if content_val and "/.gemini/" not in target_path:
                             added = len(content_val.splitlines())
                             if added > 0:
-                                add_step_metric_fn("agy.lines_of_code.count", ts_ns, float(added), {**base_attrs, "type": "added"})
+                                add_step_metric_fn("agy.lines_of_code.count", ts_ns, float(added), {**step_attrs, "type": "added"})
                     elif tname in ("edit_file", "replace_file_content", "multi_replace_file_content"):
                         chunks = args_dict.get("ReplacementChunks")
                         if isinstance(chunks, list):
@@ -938,75 +1179,84 @@ def process_conversation_db(
                             added = len(str(args_dict.get("Replacement") or args_dict.get("ReplacementContent") or "").splitlines())
                             removed = len(str(args_dict.get("Target") or args_dict.get("TargetContent") or "").splitlines())
                         if added > 0:
-                            add_step_metric_fn("agy.lines_of_code.count", ts_ns, float(added), {**base_attrs, "type": "added"})
+                            add_step_metric_fn("agy.lines_of_code.count", ts_ns, float(added), {**step_attrs, "type": "added"})
                         if removed > 0:
-                            add_step_metric_fn("agy.lines_of_code.count", ts_ns, float(removed), {**base_attrs, "type": "removed"})
+                            add_step_metric_fn("agy.lines_of_code.count", ts_ns, float(removed), {**step_attrs, "type": "removed"})
                     elif tname == "run_command":
                         cmd_line = str(args_dict.get("CommandLine") or "")
                         if re.search(r"\bgit\s+commit\b", cmd_line):
-                            add_step_metric_fn("agy.commit.count", ts_ns, 1.0, base_attrs)
+                            add_step_metric_fn("agy.commit.count", ts_ns, 1.0, step_attrs)
                         if re.search(r"\bgh\s+pr\s+create\b", cmd_line):
-                            add_step_metric_fn("agy.pull_request.count", ts_ns, 1.0, base_attrs)
+                            add_step_metric_fn("agy.pull_request.count", ts_ns, 1.0, step_attrs)
 
             last_metric_step_idx = max(last_metric_step_idx, idx)
             last_log_step_idx = max(last_log_step_idx, idx)
 
         conv_state["last_metric_step_idx"] = last_metric_step_idx
         conv_state["last_log_step_idx"] = last_log_step_idx
-        conv_state["last_step_idx"] = min(last_metric_step_idx, last_log_step_idx)
-        conv_state["pending_metric_steps"] = sorted(new_pending_metric_steps)[-50:]
-        conv_state["pending_log_steps"] = sorted(new_pending_log_steps)[-50:]
-        conv_state["pending_steps"] = sorted(new_pending_metric_steps | new_pending_log_steps)[-50:]
+        conv_state["pending_metric_steps"] = sorted(new_pending_metric_steps)
+        conv_state["pending_log_steps"] = sorted(new_pending_log_steps)
 
     finally:
         conn.close()
-        cleanup_sqlite_copy(dst)
 
     return gen_metrics, step_metrics, gen_logs + step_logs, conv_state, has_in_flight
 
 
-def export_conversation_batch(
+def build_metrics_payload(metrics_by_name: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    metrics_list = [make_sum_metric(name, dps) for name, dps in metrics_by_name.items() if dps]
+    if not metrics_list:
+        return None
+    resource_attrs = otlp_kv({"service.name": "agy"})
+    return {
+        "resourceMetrics": [
+            {
+                "resource": {"attributes": resource_attrs},
+                "scopeMetrics": [
+                    {
+                        "scope": {"name": "agy-exporter"},
+                        "metrics": metrics_list,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def build_logs_payload(logs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not logs:
+        return None
+    resource_attrs = otlp_kv({"service.name": "agy"})
+    return {
+        "resourceLogs": [
+            {
+                "resource": {"attributes": resource_attrs},
+                "scopeLogs": [
+                    {
+                        "scope": {"name": "agy-exporter"},
+                        "logRecords": logs,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def export_otlp_batch(
     metrics_by_name: dict[str, list[dict[str, Any]]],
     logs: list[dict[str, Any]],
 ) -> tuple[bool, bool]:
-    """Post metrics and logs for a single conversation, returning (metrics_ok, logs_ok)."""
-    resource_attrs = otlp_kv({"service.name": "agy"})
+    """Post combined metrics and logs for a batch, returning (metrics_ok, logs_ok)."""
     metrics_ok = True
     logs_ok = True
 
-    if metrics_by_name:
-        metrics_list = [make_sum_metric(name, dps) for name, dps in metrics_by_name.items() if dps]
-        if metrics_list:
-            metrics_payload = {
-                "resourceMetrics": [
-                    {
-                        "resource": {"attributes": resource_attrs},
-                        "scopeMetrics": [
-                            {
-                                "scope": {"name": "agy-exporter"},
-                                "metrics": metrics_list,
-                            }
-                        ],
-                    }
-                ]
-            }
-            metrics_ok = post_otlp("/v1/metrics", metrics_payload)
+    metrics_payload = build_metrics_payload(metrics_by_name)
+    if metrics_payload is not None:
+        metrics_ok, _ = post_otlp("/v1/metrics", metrics_payload)
 
-    if logs:
-        logs_payload = {
-            "resourceLogs": [
-                {
-                    "resource": {"attributes": resource_attrs},
-                    "scopeLogs": [
-                        {
-                            "scope": {"name": "agy-exporter"},
-                            "logRecords": logs,
-                        }
-                    ],
-                }
-            ]
-        }
-        logs_ok = post_otlp("/v1/logs", logs_payload)
+    logs_payload = build_logs_payload(logs)
+    if logs_payload is not None:
+        logs_ok, _ = post_otlp("/v1/logs", logs_payload)
 
     return metrics_ok, logs_ok
 
@@ -1014,17 +1264,59 @@ def export_conversation_batch(
 def load_state() -> dict[str, Any]:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(state, dict):
+                convs = state.get("conversations")
+                if isinstance(convs, dict):
+                    for c in convs.values():
+                        if not isinstance(c, dict):
+                            continue
+                        if "last_gen_idx" in c:
+                            legacy_gen = int(c.pop("last_gen_idx"))
+                            c.setdefault("last_metric_gen_idx", legacy_gen)
+                            c.setdefault("last_log_gen_idx", legacy_gen)
+                        if "last_step_idx" in c:
+                            legacy_step = int(c.pop("last_step_idx"))
+                            c.setdefault("last_metric_step_idx", legacy_step)
+                            c.setdefault("last_log_step_idx", legacy_step)
+                        if "pending_steps" in c:
+                            legacy_pending = [int(x) for x in c.pop("pending_steps")]
+                            c.setdefault("pending_metric_steps", list(legacy_pending))
+                            c.setdefault("pending_log_steps", list(legacy_pending))
+                return state
         except Exception:
             pass
     return {"conversations": {}}
 
 
+def ensure_state_dir_writable() -> None:
+    """Verify STATE_FILE.parent is writable before processing or POSTing so cursors can always be saved."""
+    state_dir = STATE_FILE.parent
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        probe = state_dir / f".write_probe_{os.getpid()}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        print(
+            f"[agy-exporter] FATAL: state directory {state_dir} (for {STATE_FILE}) is not writable by uid={os.getuid()}: {exc}",
+            flush=True,
+        )
+        raise
+
+
 def save_state(state: dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except OSError as exc:
+        print(
+            f"[agy-exporter] FATAL: cannot write state file {STATE_FILE} as uid={os.getuid()}: {exc}",
+            flush=True,
+        )
+        raise
 
 
 def merge_metric_dicts(*dicts: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
@@ -1036,34 +1328,167 @@ def merge_metric_dicts(*dicts: dict[str, list[dict[str, Any]]]) -> dict[str, lis
     return merged
 
 
+def _commit_staged_item_state(item: dict[str, Any], conv_states: dict[str, Any]) -> bool:
+    """Update conv_states[cid] from an item's current delivery status. Returns True if conv_states[cid] changed."""
+    cid = item["cid"]
+    prev_state = item["prev_state"]
+    candidate_state = item["candidate_state"]
+    metrics_ok = item["metrics_ok"]
+    logs_ok = item["logs_ok"]
+
+    next_state = dict(prev_state)
+    next_state.pop("failed_mtime_ns", None)
+    next_state.pop("fail_count", None)
+    next_state.pop("backoff_polls_remaining", None)
+
+    if metrics_ok:
+        next_state["session_counted"] = candidate_state.get("session_counted", False)
+        next_state["last_metric_gen_idx"] = candidate_state["last_metric_gen_idx"]
+        next_state["last_metric_step_idx"] = candidate_state["last_metric_step_idx"]
+        next_state["pending_metric_steps"] = candidate_state["pending_metric_steps"]
+        next_state["pending_metric_gens"] = candidate_state["pending_metric_gens"]
+
+    if logs_ok:
+        next_state["last_log_gen_idx"] = candidate_state["last_log_gen_idx"]
+        next_state["last_log_step_idx"] = candidate_state["last_log_step_idx"]
+        next_state["pending_log_steps"] = candidate_state["pending_log_steps"]
+        next_state["pending_log_gens"] = candidate_state["pending_log_gens"]
+
+    if metrics_ok and logs_ok:
+        next_state.pop("export_rejected_mtime_ns", None)
+        next_state["mtime_ns"] = item["mtime"]
+        next_state["has_in_flight"] = item["has_in_flight"]
+    elif item.get("metrics_perm_fail") or item.get("logs_perm_fail"):
+        next_state["export_rejected_mtime_ns"] = item["mtime"]
+
+    if conv_states.get(cid) != next_state:
+        conv_states[cid] = next_state
+        return True
+    return False
+
+
+def _deliver_single_conv_metrics_split(metrics_by_name: dict[str, list[dict[str, Any]]]) -> tuple[bool, bool]:
+    """Split a single conversation's metric data points into smaller sub-batches if needed."""
+    flat_pairs: list[tuple[str, dict[str, Any]]] = [
+        (m_name, dp) for m_name, dps in metrics_by_name.items() for dp in dps
+    ]
+    if len(flat_pairs) <= 1:
+        return False, False
+    payload = build_metrics_payload(metrics_by_name)
+    if payload is None or len(json.dumps(payload).encode("utf-8")) <= SINGLE_CONV_SPLIT_BYTES:
+        return False, False
+
+    sub_batches: list[dict[str, list[dict[str, Any]]]] = []
+    cur_batch: dict[str, list[dict[str, Any]]] = {}
+    cur_bytes = 256
+    for m_name, dp in flat_pairs:
+        dp_bytes = len(json.dumps(dp).encode("utf-8")) + len(m_name) + 32
+        if cur_batch and cur_bytes + dp_bytes > SINGLE_CONV_SPLIT_BYTES:
+            sub_batches.append(cur_batch)
+            cur_batch = {}
+            cur_bytes = 256
+        cur_batch.setdefault(m_name, []).append(dp)
+        cur_bytes += dp_bytes
+    if cur_batch:
+        sub_batches.append(cur_batch)
+
+    if len(sub_batches) <= 1:
+        return False, False
+
+    for sb in sub_batches:
+        sb_payload = build_metrics_payload(sb)
+        if sb_payload is None:
+            continue
+        ok, retryable = post_otlp("/v1/metrics", sb_payload)
+        if not ok:
+            return False, retryable
+    return True, False
+
+
+def _deliver_single_conv_logs_split(logs: list[dict[str, Any]]) -> tuple[bool, bool]:
+    """Split a single conversation's log records into smaller sub-batches if needed."""
+    if len(logs) <= 1:
+        return False, False
+    payload = build_logs_payload(logs)
+    if payload is None or len(json.dumps(payload).encode("utf-8")) <= SINGLE_CONV_SPLIT_BYTES:
+        return False, False
+
+    sub_batches: list[list[dict[str, Any]]] = []
+    cur_batch: list[dict[str, Any]] = []
+    cur_bytes = 256
+    for rec in logs:
+        rec_bytes = len(json.dumps(rec).encode("utf-8")) + 16
+        if cur_batch and cur_bytes + rec_bytes > SINGLE_CONV_SPLIT_BYTES:
+            sub_batches.append(cur_batch)
+            cur_batch = []
+            cur_bytes = 256
+        cur_batch.append(rec)
+        cur_bytes += rec_bytes
+    if cur_batch:
+        sub_batches.append(cur_batch)
+
+    if len(sub_batches) <= 1:
+        return False, False
+
+    for sb in sub_batches:
+        sb_payload = build_logs_payload(sb)
+        if sb_payload is None:
+            continue
+        ok, retryable = post_otlp("/v1/logs", sb_payload)
+        if not ok:
+            return False, retryable
+    return True, False
+
+
 def sync_once(state: dict[str, Any], tmp_dir: Path, persist: bool = True) -> bool:
-    """Process all conversations with per-conversation isolation and per-conversation state commits."""
+    """Process all conversations with per-conversation isolation, chunked/split OTLP export, and per-chunk state save."""
+    if persist:
+        ensure_state_dir_writable()
+
     surfaces = [
         ("cli", GEMINI_DIR / "antigravity-cli"),
         ("app", GEMINI_DIR / "antigravity"),
     ]
     conv_states: dict[str, Any] = state.setdefault("conversations", {})
-    any_exported = False
-    total_dps = 0
-    total_logs = 0
+    staged: list[dict[str, Any]] = []
+    state_dirty = False
 
     for surface_name, surface_dir in surfaces:
         conv_dir = surface_dir / "conversations"
         if not conv_dir.exists():
+            if surface_name not in _WARNED_MISSING_SURFACES:
+                _WARNED_MISSING_SURFACES.add(surface_name)
+                print(
+                    f"[agy-exporter] Surface '{surface_name}' directory not found at {conv_dir}; skipping",
+                    flush=True,
+                )
             continue
         summaries = SUMMARY_CACHE.get(surface_dir, tmp_dir)
         for db_path in sorted(conv_dir.glob("*.db")):
             cid = db_path.stem
+            prev_state = dict(conv_states.get(cid, {}))
             try:
                 wal_path = Path(str(db_path) + "-wal")
                 mtime = max(
                     db_path.stat().st_mtime_ns,
                     wal_path.stat().st_mtime_ns if wal_path.exists() else 0,
                 )
-                prev_state = conv_states.get(cid, {})
-                if prev_state.get("mtime_ns") == mtime and not prev_state.get("has_in_flight"):
-                    continue
+            except OSError:
+                continue
 
+            backoff_rem = int(prev_state.get("backoff_polls_remaining", 0))
+            if backoff_rem > 0:
+                prev_state["backoff_polls_remaining"] = backoff_rem - 1
+                conv_states[cid] = prev_state
+                state_dirty = True
+                continue
+
+            if prev_state.get("failed_mtime_ns") == mtime or prev_state.get("export_rejected_mtime_ns") == mtime:
+                continue
+            if prev_state.get("mtime_ns") == mtime and not prev_state.get("has_in_flight"):
+                continue
+
+            try:
                 gen_m, step_m, logs, candidate_state, has_in_flight = process_conversation_db(
                     surface_name,
                     surface_dir,
@@ -1072,74 +1497,225 @@ def sync_once(state: dict[str, Any], tmp_dir: Path, persist: bool = True) -> boo
                     dict(prev_state),
                     tmp_dir,
                 )
-                combined_metrics = merge_metric_dicts(gen_m, step_m)
-                dps_count = sum(len(v) for v in combined_metrics.values())
-
-                if dps_count == 0 and not logs:
-                    # Nothing new to export; record mtime so we don't re-read until modified
-                    candidate_state["mtime_ns"] = mtime
-                    candidate_state["has_in_flight"] = has_in_flight
-                    if conv_states.get(cid) != candidate_state:
-                        conv_states[cid] = candidate_state
-                        if persist:
-                            save_state(state)
-                    continue
-
-                metrics_ok, logs_ok = export_conversation_batch(combined_metrics, logs)
-                next_state = dict(prev_state)
-                next_state["active_skill"] = candidate_state.get("active_skill", "")
-                next_state["current_model"] = candidate_state.get("current_model", "auto")
-
-                if metrics_ok:
-                    next_state["session_counted"] = candidate_state.get("session_counted", False)
-                    next_state["last_metric_gen_idx"] = candidate_state["last_metric_gen_idx"]
-                    next_state["last_metric_step_idx"] = candidate_state["last_metric_step_idx"]
-                    next_state["pending_metric_steps"] = candidate_state["pending_metric_steps"]
-                    if dps_count > 0:
-                        any_exported = True
-                        total_dps += dps_count
-
-                if logs_ok:
-                    next_state["last_log_gen_idx"] = candidate_state["last_log_gen_idx"]
-                    next_state["last_log_step_idx"] = candidate_state["last_log_step_idx"]
-                    next_state["pending_log_steps"] = candidate_state["pending_log_steps"]
-                    if logs:
-                        any_exported = True
-                        total_logs += len(logs)
-
-                next_state["last_gen_idx"] = min(
-                    int(next_state.get("last_metric_gen_idx", -1)),
-                    int(next_state.get("last_log_gen_idx", -1)),
-                )
-                next_state["last_step_idx"] = min(
-                    int(next_state.get("last_metric_step_idx", -1)),
-                    int(next_state.get("last_log_step_idx", -1)),
-                )
-                next_state["pending_steps"] = sorted(
-                    set(next_state.get("pending_metric_steps", []))
-                    | set(next_state.get("pending_log_steps", []))
-                )
-
-                if metrics_ok and logs_ok:
-                    next_state["mtime_ns"] = mtime
-                    next_state["has_in_flight"] = has_in_flight
-                else:
+            except Exception as exc:
+                fail_count = int(prev_state.get("fail_count", 0)) + 1
+                backoff_polls = min(60, 2 ** fail_count)
+                if fail_count == 1:
                     print(
-                        f"[agy-exporter] Partial/failed OTLP export for {cid} "
-                        f"(metrics_ok={metrics_ok}, logs_ok={logs_ok}); committed succeeded stream cursor",
+                        f"[agy-exporter] Skipping conversation {cid} (mtime={mtime}, fail_count={fail_count}, "
+                        f"backoff_polls={backoff_polls}) due to error: {exc}\n{traceback.format_exc()}",
                         flush=True,
                     )
+                else:
+                    print(
+                        f"[agy-exporter] Skipping conversation {cid} (mtime={mtime}, fail_count={fail_count}, "
+                        f"backoff_polls={backoff_polls}) due to error: {exc}",
+                        flush=True,
+                    )
+                prev_state["failed_mtime_ns"] = mtime
+                prev_state["fail_count"] = fail_count
+                prev_state["backoff_polls_remaining"] = backoff_polls
+                conv_states[cid] = prev_state
+                state_dirty = True
+                continue
 
-                conv_states[cid] = next_state
-                if persist:
+            combined_metrics = merge_metric_dicts(gen_m, step_m)
+            dps_count = sum(len(v) for v in combined_metrics.values())
+
+            if dps_count == 0 and not logs:
+                candidate_state.pop("failed_mtime_ns", None)
+                candidate_state.pop("fail_count", None)
+                candidate_state.pop("backoff_polls_remaining", None)
+                candidate_state.pop("export_rejected_mtime_ns", None)
+                candidate_state["mtime_ns"] = mtime
+                candidate_state["has_in_flight"] = has_in_flight
+                if conv_states.get(cid) != candidate_state:
+                    conv_states[cid] = candidate_state
+                    state_dirty = True
+                continue
+
+            est_bytes = len(json.dumps(combined_metrics).encode("utf-8")) + len(json.dumps(logs).encode("utf-8"))
+            staged.append(
+                {
+                    "cid": cid,
+                    "mtime": mtime,
+                    "has_in_flight": has_in_flight,
+                    "metrics": combined_metrics,
+                    "dps_count": dps_count,
+                    "logs": logs,
+                    "log_count": len(logs),
+                    "est_bytes": est_bytes,
+                    "prev_state": prev_state,
+                    "candidate_state": candidate_state,
+                    "metrics_ok": dps_count == 0,
+                    "logs_ok": len(logs) == 0,
+                    "metrics_perm_fail": False,
+                    "logs_perm_fail": False,
+                }
+            )
+
+    any_exported = False
+    total_dps = 0
+    total_logs = 0
+
+    def deliver_metrics_group(group: list[dict[str, Any]]) -> None:
+        nonlocal any_exported, total_dps, state_dirty
+        active = [it for it in group if not it["metrics_ok"]]
+        if not active:
+            return
+        merged_m = merge_metric_dicts(*(it["metrics"] for it in active))
+        payload = build_metrics_payload(merged_m)
+        if payload is None:
+            for it in active:
+                it["metrics_ok"] = True
+                if _commit_staged_item_state(it, conv_states):
+                    state_dirty = True
+            if state_dirty and persist:
+                save_state(state)
+                state_dirty = False
+            return
+
+        ok, retryable = post_otlp("/v1/metrics", payload)
+        if ok:
+            for it in active:
+                it["metrics_ok"] = True
+                any_exported = True
+                total_dps += it["dps_count"]
+                if _commit_staged_item_state(it, conv_states):
+                    state_dirty = True
+            if state_dirty and persist:
+                save_state(state)
+                state_dirty = False
+            return
+
+        if not retryable:
+            if len(active) > 1:
+                mid = len(active) // 2
+                deliver_metrics_group(active[:mid])
+                deliver_metrics_group(active[mid:])
+                return
+            single = active[0]
+            split_ok, split_retryable = _deliver_single_conv_metrics_split(single["metrics"])
+            if split_ok:
+                single["metrics_ok"] = True
+                any_exported = True
+                total_dps += single["dps_count"]
+                if _commit_staged_item_state(single, conv_states):
+                    state_dirty = True
+                if state_dirty and persist:
                     save_state(state)
-            except Exception as exc:
+                    state_dirty = False
+                return
+            if not split_retryable:
+                single["metrics_perm_fail"] = True
                 print(
-                    f"[agy-exporter] Skipping conversation {cid} due to error: {exc}\n"
-                    f"{traceback.format_exc()}",
+                    f"[agy-exporter] Conversation {single['cid']} metrics permanently rejected by collector "
+                    f"(mtime={single['mtime']}); isolating and skipping until modified",
                     flush=True,
                 )
-                continue
+                if _commit_staged_item_state(single, conv_states):
+                    state_dirty = True
+                if state_dirty and persist:
+                    save_state(state)
+                    state_dirty = False
+
+    def deliver_logs_group(group: list[dict[str, Any]]) -> None:
+        nonlocal any_exported, total_logs, state_dirty
+        active = [it for it in group if not it["logs_ok"]]
+        if not active:
+            return
+        merged_logs: list[dict[str, Any]] = []
+        for it in active:
+            merged_logs.extend(it["logs"])
+        payload = build_logs_payload(merged_logs)
+        if payload is None:
+            for it in active:
+                it["logs_ok"] = True
+                if _commit_staged_item_state(it, conv_states):
+                    state_dirty = True
+            if state_dirty and persist:
+                save_state(state)
+                state_dirty = False
+            return
+
+        ok, retryable = post_otlp("/v1/logs", payload)
+        if ok:
+            for it in active:
+                it["logs_ok"] = True
+                any_exported = True
+                total_logs += it["log_count"]
+                if _commit_staged_item_state(it, conv_states):
+                    state_dirty = True
+            if state_dirty and persist:
+                save_state(state)
+                state_dirty = False
+            return
+
+        if not retryable:
+            if len(active) > 1:
+                mid = len(active) // 2
+                deliver_logs_group(active[:mid])
+                deliver_logs_group(active[mid:])
+                return
+            single = active[0]
+            split_ok, split_retryable = _deliver_single_conv_logs_split(single["logs"])
+            if split_ok:
+                single["logs_ok"] = True
+                any_exported = True
+                total_logs += single["log_count"]
+                if _commit_staged_item_state(single, conv_states):
+                    state_dirty = True
+                if state_dirty and persist:
+                    save_state(state)
+                    state_dirty = False
+                return
+            if not split_retryable:
+                single["logs_perm_fail"] = True
+                print(
+                    f"[agy-exporter] Conversation {single['cid']} logs permanently rejected by collector "
+                    f"(mtime={single['mtime']}); isolating and skipping until modified",
+                    flush=True,
+                )
+                if _commit_staged_item_state(single, conv_states):
+                    state_dirty = True
+                if state_dirty and persist:
+                    save_state(state)
+                    state_dirty = False
+
+    if staged:
+        chunks: list[list[dict[str, Any]]] = []
+        cur_chunk: list[dict[str, Any]] = []
+        cur_chunk_bytes = 0
+        for item in staged:
+            if cur_chunk and cur_chunk_bytes + item["est_bytes"] > MAX_BATCH_BYTES:
+                chunks.append(cur_chunk)
+                cur_chunk = []
+                cur_chunk_bytes = 0
+            cur_chunk.append(item)
+            cur_chunk_bytes += item["est_bytes"]
+        if cur_chunk:
+            chunks.append(cur_chunk)
+
+        for chunk in chunks:
+            deliver_metrics_group(chunk)
+            deliver_logs_group(chunk)
+            for item in chunk:
+                if _commit_staged_item_state(item, conv_states):
+                    state_dirty = True
+            if state_dirty and persist:
+                save_state(state)
+                state_dirty = False
+
+        failed_items = [it for it in staged if not (it["metrics_ok"] and it["logs_ok"])]
+        if failed_items:
+            print(
+                f"[agy-exporter] Partial/failed OTLP export for {len(failed_items)}/{len(staged)} conversation(s); "
+                f"committed succeeded stream cursors",
+                flush=True,
+            )
+
+    if state_dirty and persist:
+        save_state(state)
 
     if any_exported:
         print(
@@ -1157,6 +1733,12 @@ def main() -> None:
         while True:
             try:
                 sync_once(state, tmp_dir, persist=True)
+            except (PermissionError, OSError) as exc:
+                print(
+                    f"[agy-exporter] Exiting due to state file/directory error at {STATE_FILE} (uid={os.getuid()}): {exc}",
+                    flush=True,
+                )
+                sys.exit(1)
             except Exception as exc:
                 print(f"[agy-exporter] Unexpected loop error: {exc}", flush=True)
             time.sleep(POLL_INTERVAL_SEC)

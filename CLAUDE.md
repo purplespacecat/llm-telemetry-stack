@@ -17,11 +17,18 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 
 ## Data shape (Antigravity / `agy`)
 
-- Antigravity does not export OTLP natively. `agy-exporter/exporter.py` mounts `~/.gemini` read-only (`antigravity-cli` for CLI and `antigravity` for desktop), copies active SQLite `.db` + `-wal` files (excluding `-shm` so SQLite reconstructs a fresh WAL index) to `/tmp` per poll, deletes the temporary copies immediately after reading, and exports delta metrics (`agy.*`) and log events (`agy.*`) via OTLP/HTTP JSON to `otel-collector:4318`.
-- Per-conversation SQLite databases (`conversations/<id>.db`) hold internal Cortex protobuf blobs (field numbers documented in the `agy-exporter/exporter.py` module docstring): `gen_metadata` (per-request `input_tokens`, `cache_read_tokens`, `output_tokens`, `thinking_tokens`, `duration`, `ttft`, and `model`), `steps` (tool calls, status transition timestamps in field `26`, `permissions`, and `error_details`), and `trajectory_metadata_blob` (`vcs.repository.name` and `vcs.branch.name`).
-- `transcript.jsonl` supplements `steps` with command exit codes (`Command exited with code N`) and `<USER_SETTINGS_CHANGE>` model changes.
-- Progressive disclosure skill activations are detected when `read_file` or `view_file` reads `.../skills/<name>/SKILL.md` (`agy.skill_activated`), tagging subsequent cost/token points in that session with `skill.name`.
-- Each conversation is isolated in its own `try/except` block and exports independently. Metric cursors (`last_metric_gen_idx`, `last_metric_step_idx`) and log cursors (`last_log_gen_idx`, `last_log_step_idx`) are committed separately per conversation in the `agy-exporter-state` volume so a single malformed conversation or partial OTLP failure cannot wedge the exporter or duplicate metrics on retry.
+- Antigravity does not export OTLP natively. `agy-exporter` runs under the `agy` Docker Compose profile (`--profile agy`) as non-root (`1000:1000`) and emits telemetry with `ResourceAttributes['service.name'] = 'agy'`.
+- `docker-compose.yml` mounts `~/.gemini/antigravity-cli/{conversations,brain,conversation_summaries.db}` read-only with `bind.create_host_path: false`, and `docker-compose.agy-desktop.yml` (enabled via `COMPOSE_FILE=docker-compose.yml:docker-compose.agy-desktop.yml` in `.env`, configured via `AGY_APP_DIR`) adds the same three read-only mounts for `~/.gemini/antigravity`. OAuth credentials (`oauth_creds.json`, `antigravity-oauth-token`) and history are never exposed inside the container, and missing host paths fail fast instead of creating root-owned directories.
+- Per-conversation SQLite databases (`conversations/<id>.db`) are snapshotted atomically into `:memory:` via `sqlite3.Connection.backup()` (`mode=ro` with `immutable=1` fallback). Typed wire accessors (`wire_str`, `wire_int`, `wire_msg`, `wire_msg_list`) decode the internal Cortex protobuf blobs (`gen_metadata`, `steps`, and `trajectory_metadata_blob`; field numbers documented in `agy-exporter/exporter.py`).
+- `transcript.jsonl` supplements `steps` with command exit codes (`Command exited with code N`), per-step slash commands and `<USER_SETTINGS_CHANGE>` model changes.
+- Progressive disclosure skill activations use a single `extract_activated_skill()` guard across both cost/token attribution and `agy.skill_activated` log events. `agy.tool_decision` is deduplicated to at most one log record per step.
+- In-flight steps (`status in (0, 1, 2, 9)`) stay in `pending_metric_steps` / `pending_log_steps` only while within `IN_FLIGHT_STEP_GRACE_SEC` (120 s) on an active WAL; once past the grace window, they are emitted as `agy.tool_result` with `success="false"` and `error_type="abandoned"`.
+- `/state/state.json` (`STATE_FILE`) is verified writable before exporting. Each conversation is isolated in its own `try/except` block (`failed_mtime_ns` + exponential poll backoff `min(60, 2 ** fail_count)`). Conversations are exported in size-bounded OTLP chunks (`MAX_BATCH_BYTES`); HTTP 2xx with `partialSuccess` logs rejected counts and advances cursors per the OTLP spec, while HTTP `400` / `413` triggers recursive binary splitting down to single conversations (recording `export_rejected_mtime_ns` on a single conversation permanently rejected with `400`) and saves cursors (`last_metric_*`, `last_log_*`, `pending_metric_*`, `pending_log_*`) after each accepted chunk.
+- Verify any `agy-exporter`, `Dockerfile`, or compose mount change by running:
+
+```bash
+python3 agy-exporter/smoke/check.py
+```
 
 ## Tool details filter
 
@@ -39,9 +46,9 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 
 ## Changing the dashboards
 
-- `grafana/dashboards/{cost,efficiency,reliability}.json` are provisioned read-only. Edit a file, then `docker compose restart grafana`. The provider sets `disableDeletion: false`, so deleting a file removes its dashboard on restart.
+- `grafana/dashboards/{cost,efficiency,reliability}.json` (Claude Code, `service.name = 'claude-code'`, tagged `claude-code`) and `grafana/dashboards/agy-{cost,efficiency,reliability}.json` (Antigravity, `service.name = 'agy'`, tagged `antigravity`) are provisioned read-only. Edit a file, then `docker compose restart grafana`. The provider sets `disableDeletion: false`, so deleting a file removes its dashboard on restart.
 - Put a panel on the dashboard whose question it answers: spend on cost, usage and output on efficiency, errors and failures on reliability.
-- `cost.json` is the home page (`GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH`). Keep the `claude-code` tag on every dashboard; the header links find dashboards by that tag.
+- `cost.json` is the home page (`GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH`). Keep the `claude-code` tag on the Claude Code dashboards and the `antigravity` tag on the `agy-*.json` dashboards; the header links find dashboards by those tags.
 - Check panel SQL in ClickHouse before reloading. Replace `$__timeFilter(col)` with `col >= now() - INTERVAL 1 DAY` and `$__timeInterval(col)` with `toStartOfInterval(toDateTime(col), INTERVAL 3600 second)`, then run it as Grafana's user with `docker compose exec clickhouse clickhouse-client --user grafana --password grafana -q "<sql>"`.
 
 ## Generating test data

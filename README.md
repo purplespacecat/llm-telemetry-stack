@@ -31,11 +31,13 @@ You need Docker with the `docker compose` plugin.
 
 There are three dashboards, linked from each other's header. **Claude Code cost** opens as the home page, with no login.
 
-- **Claude Code cost:** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, source (main loop, subagents, skills, MCP servers) and session
+- **Claude Code cost:** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, request source (your conversation, subagents, background requests, skills, MCP servers) and session; context size per session, compactions, tokens by model, and subagent runs with their model and cost
 - **Claude Code efficiency:** active time, lines of code, commits and pull requests; which skills ran, whether you or Claude triggered them, and sessions with no skills; tool latency and permission prompts; MCP servers used; hook time and configured hooks
 - **Claude Code reliability:** API errors, error rate, retries and latency; failed tool calls by tool and error type; MCP connection failures; hook errors
 
 Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
+
+Every request re-sends the whole conversation, so context size drives most of the cost. If **Context size** stays high, run `/compact` or start a new session instead of resuming an old one.
 
 ## Privacy
 

@@ -14,6 +14,10 @@ Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse an
 - Failed `tool_result` events carry `error_type` (such as `ShellError`) with or without the flag.
 - `hook_execution_complete` is per hook event and matcher (`hook_name` such as `PreToolUse:Bash`), not per hook command. `hook_registered` lists each configured hook with `hook_source` and `plugin.name`.
 - `mcp_server_connection` rows with `status = 'disconnected'` carry the connection lifetime in `duration_ms`, not the connect time.
+- Metrics carry a coarse `query_source` (`main`, `subagent`, `auxiliary`). `api_request` events carry the detailed one: `repl_main_thread` (or `sdk` in headless runs), `agent:builtin:<name>`, `agent:custom`, and background requests such as `agent_summary`, `away_summary`, `prompt_suggestion` and `compact`. Panels that need the detail read events.
+- A request's context size is `input_tokens + cache_read_tokens + cache_creation_tokens` on `api_request`. The main thread is a `query_source` starting with `repl_main_thread`, or `sdk`.
+- `subagent_completed` carries `agent_type`, `final_model`, `duration_ms`, `total_tokens` and `total_tool_uses`. Its `agent_type` matches `agent.name` on the subagent's `api_request` events. `compaction` carries `trigger` (`manual` or `auto`), `pre_tokens` and `post_tokens`.
+- Cost is exported per request (`cost_usd`) only, never per token type.
 
 ## Tool details filter
 

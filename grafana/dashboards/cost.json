@@ -447,7 +447,7 @@
       "gridPos": {
         "x": 0,
         "y": 13,
-        "w": 8,
+        "w": 6,
         "h": 9
       },
       "targets": [
@@ -485,7 +485,7 @@
         ]
       },
       "options": {},
-      "description": "Needs OTEL_METRICS_INCLUDE_REPOSITORY=true; sessions without it show as (not recorded)."
+      "description": "Needs OTEL_METRICS_INCLUDE_REPOSITORY=true. Sessions started outside a git repository show as (not recorded)."
     },
     {
       "id": 10,
@@ -496,9 +496,9 @@
         "uid": "clickhouse"
       },
       "gridPos": {
-        "x": 8,
+        "x": 6,
         "y": 13,
-        "w": 8,
+        "w": 10,
         "h": 9
       },
       "targets": [
@@ -510,7 +510,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT Attributes['query_source'] AS source, Attributes['agent.name'] AS agent, Attributes['skill.name'] AS skill, Attributes['mcp_server.name'] AS mcp_server, sum(Value) AS cost_usd FROM otel.otel_metrics_sum WHERE MetricName = 'claude_code.cost.usage' AND $__timeFilter(TimeUnix) GROUP BY source, agent, skill, mcp_server ORDER BY cost_usd DESC LIMIT 50",
+          "rawSql": "SELECT LogAttributes['query_source'] AS source, LogAttributes['agent.name'] AS agent, LogAttributes['model'] AS model, LogAttributes['skill.name'] AS skill, LogAttributes['mcp_server.name'] AS mcp_server, count() AS requests, sum(toFloat64OrZero(LogAttributes['cost_usd'])) AS cost_usd FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'api_request' AND $__timeFilter(Timestamp) GROUP BY source, agent, model, skill, mcp_server ORDER BY cost_usd DESC LIMIT 50",
           "refId": "A"
         }
       ],
@@ -536,7 +536,7 @@
         ]
       },
       "options": {},
-      "description": "Custom agent and skill names are replaced by placeholders unless OTEL_LOG_TOOL_DETAILS=1."
+      "description": "repl_main_thread is your conversation and agent:* are subagents. agent_summary, away_summary, prompt_suggestion and compact are requests Claude Code makes in the background, on the session's model. Custom agent and skill names are replaced by placeholders unless OTEL_LOG_TOOL_DETAILS=1."
     },
     {
       "id": 11,
@@ -599,6 +599,439 @@
         ]
       },
       "options": {}
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Context",
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Context size (main thread)",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 16,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(Timestamp) AS time, substring(LogAttributes['session.id'], 1, 8) AS session, max((toUInt64OrZero(LogAttributes['input_tokens']) + toUInt64OrZero(LogAttributes['cache_read_tokens']) + toUInt64OrZero(LogAttributes['cache_creation_tokens']))) AS context FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'api_request' AND (startsWith(LogAttributes['query_source'], 'repl_main_thread') OR LogAttributes['query_source'] = 'sdk') AND $__timeFilter(Timestamp) GROUP BY time, session ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 4,
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "interval": "5m",
+      "maxDataPoints": 300,
+      "description": "Tokens sent with each request of your conversation (input + cache read + cache write), largest per interval, one line per session. Every request re-sends the whole conversation, so cost per request grows with it. /compact or /clear brings it down; resuming an old session brings it back."
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Compactions",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 23,
+        "w": 8,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT Timestamp AS time, substring(LogAttributes['session.id'], 1, 8) AS session, LogAttributes['trigger'] AS trigger, toUInt64OrZero(LogAttributes['pre_tokens']) AS before, toUInt64OrZero(LogAttributes['post_tokens']) AS after, toUInt64OrZero(LogAttributes['duration_ms']) AS duration FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'compaction' AND $__timeFilter(Timestamp) ORDER BY time DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "before"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "after"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "trigger is manual for /compact and auto when the context window filled up."
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Session context",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "WITH LogAttributes['event.name'] AS ev, ev = 'api_request' AND (startsWith(LogAttributes['query_source'], 'repl_main_thread') OR LogAttributes['query_source'] = 'sdk') AS main, (toUInt64OrZero(LogAttributes['input_tokens']) + toUInt64OrZero(LogAttributes['cache_read_tokens']) + toUInt64OrZero(LogAttributes['cache_creation_tokens'])) AS ctx SELECT LogAttributes['session.id'] AS session, anyIf(LogAttributes['vcs.repository.name'], LogAttributes['vcs.repository.name'] != '') AS repository, topKIf(1)(LogAttributes['model'], main)[1] AS model, countIf(ev = 'user_prompt') AS prompts, countIf(main) AS main_requests, argMinIf(ctx, Timestamp, main) AS first_context, avgIf(ctx, main) AS avg_context, maxIf(ctx, main) AS max_context, countIf(ev = 'compaction') AS compactions, sumIf(toFloat64OrZero(LogAttributes['cost_usd']), ev = 'api_request') AS cost_usd, cost_usd / nullIf(prompts, 0) AS cost_per_prompt FROM otel.otel_logs WHERE ev IN ('api_request', 'user_prompt', 'compaction') AND $__timeFilter(Timestamp) GROUP BY session HAVING main_requests > 0 ORDER BY cost_usd DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "first_context"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "avg_context"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "max_context"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_usd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_per_prompt"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "Context columns cover your conversation only (input + cache read + cache write per request). first_context is the first request in the time range: a resumed session starts with its whole history. cost_usd includes subagents and background requests."
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Models and subagents",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "table",
+      "title": "Tokens by model",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 10,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT Attributes['model'] AS model, sumIf(Value, MetricName = 'claude_code.token.usage' AND Attributes['type'] = 'input') AS input, sumIf(Value, MetricName = 'claude_code.token.usage' AND Attributes['type'] = 'cacheRead') AS cache_read, sumIf(Value, MetricName = 'claude_code.token.usage' AND Attributes['type'] = 'cacheCreation') AS cache_write, sumIf(Value, MetricName = 'claude_code.token.usage' AND Attributes['type'] = 'output') AS output, sumIf(Value, MetricName = 'claude_code.cost.usage') AS cost_usd FROM otel.otel_metrics_sum WHERE MetricName IN ('claude_code.token.usage', 'claude_code.cost.usage') AND $__timeFilter(TimeUnix) GROUP BY model ORDER BY cost_usd DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "input"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cache_read"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cache_write"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "output"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_usd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "Claude Code doesn't export cost per token type. Cache reads are cheap per token but grow with context size."
+    },
+    {
+      "id": 18,
+      "type": "table",
+      "title": "Subagents",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 42,
+        "w": 14,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "WITH LogAttributes['event.name'] AS ev, ev = 'subagent_completed' AS done SELECT if(done, LogAttributes['agent_type'], LogAttributes['agent.name']) AS agent, if(done, LogAttributes['final_model'], LogAttributes['model']) AS model, countIf(done) AS runs, avgIfOrNull(toUInt64OrZero(LogAttributes['duration_ms']), done) AS avg_duration, sumIf(toUInt64OrZero(LogAttributes['total_tokens']), done) AS tokens, sumIf(toUInt64OrZero(LogAttributes['total_tool_uses']), done) AS tool_uses, sumIf(toFloat64OrZero(LogAttributes['cost_usd']), NOT done) AS cost_usd FROM otel.otel_logs WHERE (done OR (ev = 'api_request' AND startsWith(LogAttributes['query_source'], 'agent:'))) AND $__timeFilter(Timestamp) GROUP BY agent, model ORDER BY cost_usd DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "avg_duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tokens"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_usd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "description": "Runs, duration, tokens and tool uses come from finished subagents; cost from their API requests. A subagent whose definition sets no model runs on the session's model."
     }
   ]
 }

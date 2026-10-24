@@ -13,7 +13,8 @@ SUMMARY_CACHE) start clean each time.
 usage: smoke.py <scenario> <exporter.py> <gemini_dir> <work_dir>
 scenarios: baseline | unwritable-state | partial-success | poisoned-conversation | body-limit |
            compose-mounts | long-running-step | crashed-session | misconfigured-endpoint |
-           subbatch-partial-failure | poisoned-record | close-on-large | save-fails-after-post
+           subbatch-partial-failure | poisoned-record | close-on-large | save-fails-after-post |
+           damaged-state
 """
 import collections
 import contextlib
@@ -332,6 +333,54 @@ def set_idle(db: Path, seconds: float) -> None:
             os.utime(p, ns=(t, t))
 
 
+class Stop(Exception):
+    pass
+
+
+def run_main(mod, polls):
+    """Run the exporter's main() as the container does, for `polls` polls. Returns (exit code, POSTs per poll, log lines)."""
+    n = {"sleeps": 0, "seen": 0}
+    per_poll = []
+
+    class Clock:
+        def __getattr__(self, attr):
+            return getattr(time, attr)
+
+        def sleep(self, _seconds):
+            per_poll.append(len(C.posts) - n["seen"])
+            n["seen"] = len(C.posts)
+            n["sleeps"] += 1
+            if n["sleeps"] >= polls:
+                raise Stop()
+
+    mod.time = Clock()
+    C.posts = []
+    exited = None
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        try:
+            mod.main()
+        except Stop:
+            pass
+        except SystemExit as exc:
+            exited = exc.code
+    return exited, per_poll, log.getvalue().splitlines()
+
+
+def report(label, result, **extra):
+    exited, per_poll, lines = result
+    print("@@" + json.dumps({
+        "cycle": label,
+        "exited": exited,
+        "posts_per_poll": per_poll,
+        "items_ingested": sum(p.get("items", 0) for p in C.posts if p.get("status") == 200),
+        "duplicates_ingested": sum(p.get("dupes", 0) for p in C.posts),
+        "state_file_written": Path(os.environ["STATE_FILE"]).exists(),
+        "fatal": next((l for l in lines if "FATAL" in l), None),
+        **extra,
+    }))
+
+
 WORK.mkdir(parents=True, exist_ok=True)
 STATE_DIR = WORK / "state"
 STATE_DIR.mkdir(exist_ok=True)
@@ -527,48 +576,6 @@ elif SCENARIO == "close-on-large":
 elif SCENARIO == "save-fails-after-post":
     # The disk fills after a request was accepted. The exporter must neither exit (restarting from
     # the last saved state re-sends what was accepted) nor keep exporting what it cannot record.
-    class Stop(Exception):
-        pass
-
-    def run_main(mod, polls):
-        n = {"sleeps": 0, "seen": 0}
-        per_poll = []
-
-        class Clock:
-            def __getattr__(self, attr):
-                return getattr(time, attr)
-
-            def sleep(self, _seconds):
-                per_poll.append(len(C.posts) - n["seen"])
-                n["seen"] = len(C.posts)
-                n["sleeps"] += 1
-                if n["sleeps"] >= polls:
-                    raise Stop()
-
-        mod.time = Clock()
-        C.posts = []
-        exited = None
-        log = io.StringIO()
-        with contextlib.redirect_stdout(log):
-            try:
-                mod.main()
-            except Stop:
-                pass
-            except SystemExit as exc:
-                exited = exc.code
-        return exited, per_poll
-
-    def report(label, result):
-        exited, per_poll = result
-        print("@@" + json.dumps({
-            "cycle": label,
-            "exited": exited,
-            "posts_per_poll": per_poll,
-            "items_ingested": sum(p.get("items", 0) for p in C.posts if p.get("status") == 200),
-            "duplicates_ingested": sum(p.get("dupes", 0) for p in C.posts),
-            "state_file_written": Path(os.environ["STATE_FILE"]).exists(),
-        }))
-
     mod = load_module()
     saves = {"n": 0}
     real_save = mod.save_state
@@ -582,6 +589,40 @@ elif SCENARIO == "save-fails-after-post":
     mod.save_state = failing_save
     report("1 disk full for the first three saves, 5 polls", run_main(mod, polls=5))
     report("2 restart with a working disk, 2 polls", run_main(load_module(), polls=2))
+
+elif SCENARIO == "damaged-state":
+    # A crash or power loss soon after a save can leave state.json empty or cut short. Starting over
+    # from empty state would export every conversation again, so the exporter must stop instead.
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def recording_fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_ino))
+        return real_fsync(fd)
+
+    def recording_replace(src, dst, **kw):
+        events.append(("replace", os.stat(src).st_ino))
+        return real_replace(src, dst, **kw)
+
+    os.fsync, os.replace = recording_fsync, recording_replace
+    first = run_main(load_module(), polls=2)
+    os.fsync, os.replace = real_fsync, real_replace
+
+    # Each rename must come after an fsync of the file it moves and before an fsync of the directory.
+    state_file = Path(os.environ["STATE_FILE"])
+    dir_ino = state_file.parent.stat().st_ino
+    renames = [i for i, e in enumerate(events) if e[0] == "replace"]
+    bounds = [-1] + renames + [len(events)]
+    in_order = bool(renames) and all(
+        ("fsync", events[r][1]) in events[bounds[k] + 1:r] and ("fsync", dir_ino) in events[r + 1:bounds[k + 2]]
+        for k, r in enumerate(renames)
+    )
+    report("1 cold start, 2 polls", first, saves=len(renames), saves_fsynced_in_order=in_order)
+
+    damaged = state_file.read_bytes()[: state_file.stat().st_size // 2]
+    state_file.write_bytes(damaged)
+    report("2 restart with state.json cut in half, 2 polls", run_main(load_module(), polls=2),
+           state_file_unchanged=state_file.read_bytes() == damaged)
 
 else:
     sys.exit(f"unknown scenario {SCENARIO}")

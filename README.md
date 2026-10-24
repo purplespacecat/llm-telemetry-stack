@@ -145,6 +145,18 @@ ORDER BY day DESC
   ```
 
   Start the stack with `podman compose` in place of `docker compose`. It needs the `docker-compose` binary on your `PATH` and the Podman socket running (`systemctl --user start podman.socket`).
+- **`agy-exporter` keeps restarting with `cannot read /state/state.json`:** the file that records what the exporter has sent is damaged, usually by a crash or power loss. To export your Antigravity history again without duplicates, delete the Antigravity data in ClickHouse, then the file:
+
+  ```bash
+  docker compose stop agy-exporter
+  docker compose exec clickhouse clickhouse-client --user otel --password otel --multiquery -q "
+    DELETE FROM otel.otel_metrics_sum WHERE ServiceName = 'agy';
+    DELETE FROM otel.otel_logs WHERE ServiceName = 'agy'"
+  docker compose run --rm --no-deps --entrypoint rm agy-exporter /state/state.json
+  docker compose --profile agy up -d
+  ```
+
+  Conversations you have deleted from Antigravity since they were exported can't be exported again.
 - **Stack resources shows large ClickHouse logs after an upgrade:** earlier versions of this stack kept ClickHouse's internal logs with no expiry. Drop the old tables once:
 
   ```bash

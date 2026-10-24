@@ -9,6 +9,9 @@
             <quota>default</quota>
             <grants>
                 <query>GRANT SELECT ON otel.*</query>
+                <query>GRANT SELECT ON system.parts</query>
+                <query>GRANT SELECT ON system.disks</query>
+                <query>GRANT SHOW TABLES ON system.*</query>
             </grants>
         </grafana>
     </users>

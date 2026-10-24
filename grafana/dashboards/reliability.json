@@ -45,6 +45,18 @@
       "targetBlank": false,
       "title": "Antigravity",
       "icon": "external link"
+    },
+    {
+      "type": "dashboards",
+      "tags": [
+        "stack"
+      ],
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "title": "",
+      "icon": "external link"
     }
   ],
   "panels": [

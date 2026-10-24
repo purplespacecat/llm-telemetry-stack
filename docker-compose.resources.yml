@@ -1,0 +1,25 @@
+# Container CPU, memory, network and disk metrics for the Stack resources dashboard.
+# Enable with COMPOSE_FILE in .env; see README.md.
+services:
+  container-stats:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    # The socket belongs to root (Docker) or to you (rootless Docker or Podman).
+    user: "0:0"
+    environment:
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - ./collector/container-stats.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - type: bind
+        source: ${DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped

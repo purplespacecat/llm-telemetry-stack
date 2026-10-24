@@ -33,6 +33,18 @@
       "targetBlank": false,
       "title": "",
       "icon": "external link"
+    },
+    {
+      "type": "dashboards",
+      "tags": [
+        "agy"
+      ],
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "title": "Antigravity",
+      "icon": "external link"
     }
   ],
   "panels": [

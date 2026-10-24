@@ -1,10 +1,10 @@
 # llm-telemetry-stack
 
-Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse and shows it in Grafana. Public repo: keep it generic, with no employer-specific names, endpoints or settings.
+Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemetry data in ClickHouse and shows it in Grafana. Public repo: keep it generic, with no employer-specific names, endpoints or settings.
 
 `README.md` is for users: setup, running, what the dashboard shows. Keep it short; internals and gotchas go here.
 
-## Data shape
+## Data shape (Claude Code)
 
 - Claude Code exports metrics with delta temporality (`AggregationTemporality = 1` in `otel.otel_metrics_sum`), so `sum(Value)` per bucket is the usage in that bucket. Don't use `max` or rate functions.
 - Event names live in `LogAttributes['event.name']`. The exporter's `EventName` column stays empty for Claude Code events (collector 0.161.0, Claude Code 2.1.303).
@@ -18,6 +18,22 @@ Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse an
 - A request's context size is `input_tokens + cache_read_tokens + cache_creation_tokens` on `api_request`. The main thread is a `query_source` starting with `repl_main_thread`, or `sdk`.
 - `subagent_completed` carries `agent_type`, `final_model`, `duration_ms`, `total_tokens` and `total_tool_uses`. Its `agent_type` matches `agent.name` on the subagent's `api_request` events. `compaction` carries `trigger` (`manual` or `auto`), `pre_tokens` and `post_tokens`.
 - Cost is exported per request (`cost_usd`) only, never per token type.
+
+## Data shape (Antigravity / `agy`)
+
+- Antigravity does not export OTLP natively. `agy-exporter` reads its local SQLite stores and sends `agy.*` metrics and log events with `ResourceAttributes['service.name'] = 'agy'`. It runs under the `agy` Compose profile as `${AGY_UID}:${AGY_GID}` (default `1000:1000`). The image creates `/state` with mode 0777, so a fresh state volume is writable by whichever uid that is.
+- Each Antigravity surface is an opt-in Compose override listed in `COMPOSE_FILE`: `docker-compose.agy-cli.yml` for `~/.gemini/antigravity-cli` and `docker-compose.agy-desktop.yml` for `~/.gemini/antigravity`. The base file mounts neither, so a machine with only one of the apps can start. Each override mounts exactly what the exporter reads, read-only: `conversations/`, `brain/` and `conversation_summaries.db`.
+- Don't mount a whole surface directory: it holds `antigravity-oauth-token`, `settings.json` and `history.jsonl`. Don't mount `-wal` or `-shm` files one by one either. SQLite deletes and recreates them, and Docker turns a missing short-syntax source into a root-owned directory inside `~/.gemini`. The overrides use long syntax with `bind.create_host_path: false`, so a missing path fails `compose up` instead.
+- Per-conversation databases (`conversations/<id>.db`) are snapshotted into `:memory:` with `sqlite3.Connection.backup()`, opened `mode=ro` with an `immutable=1` fallback. This reads committed rows that exist only in a live `-wal` behind the read-only mount. Typed wire accessors (`wire_str`, `wire_int`, `wire_msg`, `wire_msg_list`) decode the Cortex protobuf blobs in `gen_metadata`, `steps` and `trajectory_metadata_blob`; the field numbers are in the `exporter.py` docstring.
+- `agent.name` comes from the conversation's own `trajectory_metadata_blob`. A subagent's trajectory carries its agent definition (field 4) and its invocation (field 8), each with the name at field 1. `conversation_summaries.db` is only the fallback: mounted as a single file it is read without its `-wal`, so rows for new conversations can stay invisible until Antigravity checkpoints.
+- `transcript.jsonl` supplements `steps` with command exit codes (`Command exited with code N`), per-step slash commands and `<USER_SETTINGS_CHANGE>` model changes.
+- Skill activations use one `extract_activated_skill()` guard for both cost and token attribution and `agy.skill_activated`. `agy.tool_decision` is one record per step: Antigravity raises a permission request per sub-command of a compound command, and those requests share every attribute.
+- A step with status 0, 1, 2 or 9 is in flight. It stays in `pending_*_steps` until it finishes, or until its conversation has gone `ABANDON_IDLE_SEC` (env, default 6 h) without a write. A step's age proves nothing, because a running tool call or subagent doesn't write to its parent's database; the window has to outlast the longest one. A conversation with steps in flight is revisited at `abandon_check_ns` even if nothing on disk changes.
+- An abandoned step with a tool call becomes `agy.tool_result` with `success="false"` and `error_type="abandoned"`. An unanswered permission prompt (status 9) gets `decision="unanswered"`. An abandoned step without a tool call, such as a planner step cut off mid-stream, produces no `tool_result`.
+- Records go out in requests of at most `MAX_BATCH_BYTES`, and `post_otlp()` classifies every answer. Only HTTP 400 means the data is bad. A 400 or 413, or a connection dropped while sending more than `CONNECTION_DROP_SPLIT_BYTES`, splits the request in half and sends both halves, down to single records; a single record that is still refused is dropped and logged. Every other failure (401, 403, 404, 408, 429, 5xx, timeouts) is retried on the next poll and discards nothing. A 2xx with `partialSuccess` is logged and counts as delivered, as the OTLP spec requires.
+- A conversation's cursors for a stream (`last_metric_*` and `pending_metric_*`, or `last_log_*` and `pending_log_*`) advance only once every record of that stream is settled. Until then the conversation keeps a ledger of settled record fingerprints (`settled`), saved after every accepted request. A retry after any failure, including a crash, therefore sends only what the collector has not yet answered for good.
+- `/state/state.json` (`STATE_FILE`): the exporter exits at startup if the state directory can't take a 64 KiB write. After startup a failed save never exits, because the in-memory cursors are the only record of what the collector has accepted and restarting from the last saved state would send it again. It sends nothing more until a save succeeds. A conversation whose database fails to parse is logged once with a traceback and retried with backoff (`failed_mtime_ns`, `fail_count`, `backoff_polls_remaining`).
+- Verify any change to `agy-exporter`, its `Dockerfile` or the compose files with `python3 agy-exporter/smoke/check.py`. It snapshots `~/.gemini` read-only, drives the exporter against a fake OTLP collector through each of the cases above, and exits non-zero if a check fails. Keep test fixtures read-only like the real mount: in a writable directory the exporter's own read creates a `-wal`, which changes the mtime it keys on and hides what it would do in the container.
 
 ## Tool details filter
 
@@ -35,9 +51,9 @@ Docker Compose stack that stores Claude Code OpenTelemetry data in ClickHouse an
 
 ## Changing the dashboards
 
-- `grafana/dashboards/{cost,efficiency,reliability}.json` are provisioned read-only. Edit a file, then `docker compose restart grafana`. The provider sets `disableDeletion: false`, so deleting a file removes its dashboard on restart.
+- `grafana/dashboards/{cost,efficiency,reliability}.json` (Claude Code, `service.name = 'claude-code'`, tagged `claude-code`) and `grafana/dashboards/agy-{cost,efficiency,reliability}.json` (Antigravity, `service.name = 'agy'`, tagged `agy`) are provisioned read-only. Edit a file, then `docker compose restart grafana`. The provider sets `disableDeletion: false`, so deleting a file removes its dashboard on restart.
 - Put a panel on the dashboard whose question it answers: spend on cost, usage and output on efficiency, errors and failures on reliability.
-- `cost.json` is the home page (`GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH`). Keep the `claude-code` tag on every dashboard; the header links find dashboards by that tag.
+- `cost.json` is the home page (`GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH`). Keep the `claude-code` tag on the Claude Code dashboards and the `agy` tag on the `agy-*.json` dashboards; the header links find dashboards by those tags.
 - Check panel SQL in ClickHouse before reloading. Replace `$__timeFilter(col)` with `col >= now() - INTERVAL 1 DAY` and `$__timeInterval(col)` with `toStartOfInterval(toDateTime(col), INTERVAL 3600 second)`, then run it as Grafana's user with `docker compose exec clickhouse clickhouse-client --user grafana --password grafana -q "<sql>"`.
 
 ## Generating test data

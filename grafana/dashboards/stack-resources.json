@@ -1,0 +1,712 @@
+{
+  "uid": "stack-resources",
+  "title": "Stack resources",
+  "description": "CPU, memory, network and disk used by this telemetry stack's containers, and how much data ClickHouse stores.",
+  "tags": [
+    "stack"
+  ],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": [
+        "claude-code"
+      ],
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "title": "Claude Code",
+      "icon": "external link"
+    },
+    {
+      "type": "dashboards",
+      "tags": [
+        "agy"
+      ],
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "title": "Antigravity",
+      "icon": "external link"
+    }
+  ],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "CPU (last 5 min)",
+      "description": "CPU used by the stack's containers over the 5 minutes before the end of the time range. 100% is one CPU core. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT sum(rate) * 100 AS cpu FROM ( SELECT ResourceAttributes['compose.service'] AS container, sum(Value) / 1e9 / (sum(dateDiff('millisecond', StartTimeUnix, TimeUnix)) / 1e3) AS rate FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.cpu.usage.total' AND TimeUnix > $__toTime - INTERVAL 5 MINUTE AND TimeUnix <= $__toTime GROUP BY container)",
+          "refId": "A"
+        }
+      ],
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Memory (last 5 min)",
+      "description": "Memory used by the stack's containers, from the latest sample in the 5 minutes before the end of the time range. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT sum(memory) AS memory FROM ( SELECT ResourceAttributes['compose.service'] AS container, argMax(Value, TimeUnix) AS memory FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.memory.usage.total' AND TimeUnix > $__toTime - INTERVAL 5 MINUTE AND TimeUnix <= $__toTime GROUP BY container)",
+          "refId": "A"
+        }
+      ],
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "Peak memory",
+      "description": "The most memory the stack's containers used at once in the time range. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT max(total) AS peak FROM ( SELECT toStartOfMinute(TimeUnix) AS minute, sum(Value) AS total FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.memory.usage.total' AND $__timeFilter(TimeUnix) GROUP BY minute)",
+          "refId": "A"
+        }
+      ],
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Telemetry data",
+      "description": "Disk space the stored telemetry uses in ClickHouse, now. It is kept for one year.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT sum(bytes_on_disk) AS stored FROM system.parts WHERE active AND database = 'otel'",
+          "refId": "A"
+        }
+      ],
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "ClickHouse logs",
+      "description": "Disk space ClickHouse's own logs use (the system database), now. The stack keeps only the query, error and asynchronous insert logs, for a week or less.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT sum(bytes_on_disk) AS stored FROM system.parts WHERE active AND database = 'system'",
+          "refId": "A"
+        }
+      ],
+      "id": 5
+    },
+    {
+      "type": "stat",
+      "title": "Free disk",
+      "description": "Free space on the disk that holds ClickHouse's data, now.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT free_space AS free FROM system.disks WHERE name = 'default'",
+          "refId": "A"
+        }
+      ],
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU by container",
+      "description": "CPU used by each container. 100% is one CPU core. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "interval": "1m",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "fillOpacity": 0,
+            "spanNulls": 180000
+          },
+          "unit": "percent",
+          "displayName": "${__field.labels.container}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(TimeUnix) AS time, ResourceAttributes['compose.service'] AS container, sum(Value) / 1e9 / (sum(dateDiff('millisecond', StartTimeUnix, TimeUnix)) / 1e3) * 100 AS cpu FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.cpu.usage.total' AND $__timeFilter(TimeUnix) GROUP BY time, container ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory by container",
+      "description": "Memory used by each container. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "interval": "1m",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "fillOpacity": 20,
+            "spanNulls": 180000
+          },
+          "unit": "bytes",
+          "displayName": "${__field.labels.container}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(TimeUnix) AS time, ResourceAttributes['compose.service'] AS container, avg(Value) AS memory FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.memory.usage.total' AND $__timeFilter(TimeUnix) GROUP BY time, container ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Network traffic by container",
+      "description": "Bytes each container sent and received, mostly telemetry moving between the stack's own services. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "interval": "1m",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "fillOpacity": 0,
+            "spanNulls": 180000
+          },
+          "unit": "Bps",
+          "displayName": "${__field.labels.container}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT time, container, sum(rate) AS bytes FROM ( SELECT $__timeInterval(TimeUnix) AS time, ResourceAttributes['compose.service'] AS container, sum(Value) / (sum(dateDiff('millisecond', StartTimeUnix, TimeUnix)) / 1e3) AS rate FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName IN ('container.network.io.usage.rx_bytes', 'container.network.io.usage.tx_bytes') AND $__timeFilter(TimeUnix) GROUP BY time, container, MetricName ) GROUP BY time, container ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Disk I/O by container",
+      "description": "Bytes each container read from and wrote to disk. Reads served from the page cache don't count. Needs docker-compose.resources.yml in COMPOSE_FILE.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "interval": "1m",
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "fillOpacity": 0,
+            "spanNulls": 180000
+          },
+          "unit": "Bps",
+          "displayName": "${__field.labels.container}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT time, container, sum(rate) AS bytes FROM ( SELECT $__timeInterval(TimeUnix) AS time, ResourceAttributes['compose.service'] AS container, sum(Value) / (sum(dateDiff('millisecond', StartTimeUnix, TimeUnix)) / 1e3) AS rate FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName IN ('container.blockio.io_service_bytes_recursive') AND $__timeFilter(TimeUnix) GROUP BY time, container, Attributes['operation'] ) GROUP BY time, container ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "id": 10
+    },
+    {
+      "type": "table",
+      "title": "Storage by table",
+      "description": "Records and disk space per ClickHouse table, now: telemetry in otel, ClickHouse's own logs in system. Compression is the uncompressed size divided by the size on disk.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "on_disk"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "table"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "compression"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix:\u00d7"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT concat(database, '.', table) AS table, sum(rows) AS records, sum(bytes_on_disk) AS on_disk, sum(data_uncompressed_bytes) / sum(bytes_on_disk) AS compression FROM system.parts WHERE active GROUP BY table ORDER BY on_disk DESC",
+          "refId": "A"
+        }
+      ],
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Stored records by source",
+      "description": "Records stored per source, by the time they describe. Antigravity history imported on first start appears on the days it happened.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "interval": "1h",
+      "gridPos": {
+        "x": 12,
+        "y": 22,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "fillOpacity": 80
+          },
+          "unit": "short",
+          "displayName": "${__field.labels.source}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT time, source, sum(n) AS records FROM ( SELECT $__timeInterval(TimeUnix) AS time, ServiceName AS source, count() AS n FROM otel.otel_metrics_sum WHERE $__timeFilter(TimeUnix) GROUP BY time, source UNION ALL SELECT $__timeInterval(TimeUnix) AS time, ServiceName AS source, count() AS n FROM otel.otel_metrics_gauge WHERE $__timeFilter(TimeUnix) GROUP BY time, source UNION ALL SELECT $__timeInterval(TimeUnix) AS time, ServiceName AS source, count() AS n FROM otel.otel_metrics_histogram WHERE $__timeFilter(TimeUnix) GROUP BY time, source UNION ALL SELECT $__timeInterval(Timestamp) AS time, ServiceName AS source, count() AS n FROM otel.otel_logs WHERE $__timeFilter(Timestamp) GROUP BY time, source UNION ALL SELECT $__timeInterval(Timestamp) AS time, ServiceName AS source, count() AS n FROM otel.otel_traces WHERE $__timeFilter(Timestamp) GROUP BY time, source ) GROUP BY time, source ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "id": 12
+    }
+  ]
+}

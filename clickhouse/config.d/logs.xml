@@ -1,0 +1,29 @@
+<clickhouse>
+    <!-- The image logs at trace level to files inside the container, rotated at 10 x 1 GB.
+         Log information and above to the console instead, for docker compose logs. -->
+    <logger>
+        <level>information</level>
+        <console>1</console>
+        <log remove="1"/>
+        <errorlog remove="1"/>
+    </logger>
+
+    <!-- Profiling and metrics history that nothing in this stack reads. Each table flushes a
+         new part every few seconds, and those parts are merged and logged in turn. -->
+    <text_log remove="1"/>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <part_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <background_schedule_pool_log remove="1"/>
+
+    <!-- Kept for debugging queries and errors, for a week. -->
+    <query_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </query_log>
+    <error_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </error_log>
+</clickhouse>

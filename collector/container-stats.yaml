@@ -1,0 +1,82 @@
+receivers:
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 60s
+    container_labels_to_metric_labels:
+      com.docker.compose.project: compose.project
+      com.docker.compose.service: compose.service
+    metrics:
+      # Podman's one-shot stats make the utilization gauge meaningless; the
+      # dashboard derives CPU from container.cpu.usage.total instead.
+      container.cpu.utilization:
+        enabled: false
+      container.cpu.usage.kernelmode:
+        enabled: false
+      container.cpu.usage.usermode:
+        enabled: false
+      container.memory.percent:
+        enabled: false
+      container.memory.usage.limit:
+        enabled: false
+      container.network.io.usage.rx_dropped:
+        enabled: false
+      container.network.io.usage.tx_dropped:
+        enabled: false
+
+processors:
+  # Keep only this stack's containers out of everything the socket can see.
+  filter/this-stack:
+    error_mode: ignore
+    metrics:
+      metric:
+        - resource.attributes["compose.project"] != "${env:COMPOSE_PROJECT}"
+      datapoint:
+        - metric.name == "container.blockio.io_service_bytes_recursive" and ToLowerCase(datapoint.attributes["operation"]) != "read" and ToLowerCase(datapoint.attributes["operation"]) != "write"
+  # A write to an encrypted or LVM volume is counted on every device in the
+  # stack (dm-0 and the disk under it), so take the largest, not the sum.
+  metrics_transform/collapse-devices:
+    transforms:
+      - include: container.blockio.io_service_bytes_recursive
+        action: update
+        operations:
+          - action: aggregate_labels
+            label_set: [operation]
+            aggregation_type: max
+  # Each point then carries its own interval (StartTimeUnix to TimeUnix), so
+  # sum(Value) / sum(interval) is the rate at any zoom level.
+  cumulative_to_delta:
+    initial_value: drop
+    include:
+      metrics:
+        - container.cpu.usage.total
+        - container.network.io.usage.rx_bytes
+        - container.network.io.usage.tx_bytes
+        - container.blockio.io_service_bytes_recursive
+      match_type: strict
+  resource:
+    attributes:
+      - key: service.name
+        value: container-stats
+        action: upsert
+      - key: container.hostname
+        action: delete
+      - key: container.id
+        action: delete
+      - key: container.runtime
+        action: delete
+
+exporters:
+  otlp_grpc:
+    endpoint: otel-collector:4317
+    tls:
+      insecure: true
+
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    metrics:
+      receivers: [docker_stats]
+      processors: [filter/this-stack, metrics_transform/collapse-devices, cumulative_to_delta, resource]
+      exporters: [otlp_grpc]

@@ -326,6 +326,15 @@ def main() -> int:
               sf1["posts_per_poll"][0] > 0 and sf1["posts_per_poll"][1:3] == [0, 0],
               f"POSTs per poll {sf1['posts_per_poll']} (disk full for polls 1-3)")
 
+        ds1, ds2 = scenario("damaged-state", snap, work)
+        check("each state save fsyncs the file before the rename and the directory after it",
+              ds1["saves_fsynced_in_order"], f"{ds1['saves']} saves, not all in order")
+        check("a damaged state file stops the exporter instead of exporting everything again",
+              ds1["items_ingested"] > 0 and ds2["exited"] not in (None, 0) and ds2["items_ingested"] == 0
+              and ds2["state_file_unchanged"],
+              f"exited={ds2['exited']}, sent {ds2['items_ingested']} items ({ds2['duplicates_ingested']} duplicates) "
+              f"after the restart, damaged file kept={ds2['state_file_unchanged']}")
+
         base_only = agy_mounts([REPO / "docker-compose.yml"])
         check("the base compose file mounts no Antigravity data (each surface is an opt-in override)",
               not base_only, f"docker-compose.yml alone mounts {[rel for _, rel in base_only]}")

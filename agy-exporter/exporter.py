@@ -1253,32 +1253,45 @@ def build_logs_payload(logs: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 
+class StateLoadError(Exception):
+    """The state file exists but can't be read, so the exporter can't tell what it has already sent."""
+
+
 def load_state() -> dict[str, Any]:
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(state, dict):
-                convs = state.get("conversations")
-                if isinstance(convs, dict):
-                    for c in convs.values():
-                        if not isinstance(c, dict):
-                            continue
-                        if "last_gen_idx" in c:
-                            legacy_gen = int(c.pop("last_gen_idx"))
-                            c.setdefault("last_metric_gen_idx", legacy_gen)
-                            c.setdefault("last_log_gen_idx", legacy_gen)
-                        if "last_step_idx" in c:
-                            legacy_step = int(c.pop("last_step_idx"))
-                            c.setdefault("last_metric_step_idx", legacy_step)
-                            c.setdefault("last_log_step_idx", legacy_step)
-                        if "pending_steps" in c:
-                            legacy_pending = [int(x) for x in c.pop("pending_steps")]
-                            c.setdefault("pending_metric_steps", list(legacy_pending))
-                            c.setdefault("pending_log_steps", list(legacy_pending))
-                return state
-        except Exception:
-            pass
-    return {"conversations": {}}
+    """Read the saved cursors. A missing file means a first start.
+
+    A file that can't be read is fatal: starting over from empty state would export every
+    conversation again and duplicate all of it in ClickHouse.
+    """
+    if not STATE_FILE.exists():
+        return {"conversations": {}}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError(f"expected a JSON object, found {type(state).__name__}")
+        convs = state.get("conversations")
+        if isinstance(convs, dict):
+            for c in convs.values():
+                if not isinstance(c, dict):
+                    continue
+                if "last_gen_idx" in c:
+                    legacy_gen = int(c.pop("last_gen_idx"))
+                    c.setdefault("last_metric_gen_idx", legacy_gen)
+                    c.setdefault("last_log_gen_idx", legacy_gen)
+                if "last_step_idx" in c:
+                    legacy_step = int(c.pop("last_step_idx"))
+                    c.setdefault("last_metric_step_idx", legacy_step)
+                    c.setdefault("last_log_step_idx", legacy_step)
+                if "pending_steps" in c:
+                    legacy_pending = [int(x) for x in c.pop("pending_steps")]
+                    c.setdefault("pending_metric_steps", list(legacy_pending))
+                    c.setdefault("pending_log_steps", list(legacy_pending))
+        return state
+    except (OSError, ValueError, TypeError) as exc:
+        raise StateLoadError(
+            f"cannot read {STATE_FILE}: {exc}. Starting from empty state would export every "
+            "conversation again; see 'Troubleshooting' in the README"
+        ) from exc
 
 
 class StatePersistError(Exception):
@@ -1312,10 +1325,26 @@ def ensure_state_dir_writable() -> None:
 
 
 def save_state(state: dict[str, Any]) -> None:
+    """Replace the state file atomically and durably.
+
+    Without the fsync, a crash or power loss soon after the rename can leave an empty state file on
+    file systems that don't flush a renamed file by themselves, such as XFS.
+    """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(state, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
+    # Persist the rename too. Where a directory can't be fsynced, a crash can at worst bring back the
+    # previous state file, which is intact.
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(STATE_FILE.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def persist_state(state: dict[str, Any]) -> None:
@@ -1608,11 +1637,11 @@ def main() -> None:
     print(f"[agy-exporter] Watching {GEMINI_DIR} -> {OTLP_HTTP_ENDPOINT}", flush=True)
     try:
         ensure_state_dir_writable()
-    except StatePersistError as exc:
+        state = load_state()
+    except (StatePersistError, StateLoadError) as exc:
         # Nothing has been sent yet, so exiting loses nothing, and the restart loop makes it visible.
         print(f"[agy-exporter] FATAL: {exc}", flush=True)
         sys.exit(1)
-    state = load_state()
     last_paused_log = float("-inf")
     with tempfile.TemporaryDirectory(prefix="agy-db-") as tmp_str:
         tmp_dir = Path(tmp_str)

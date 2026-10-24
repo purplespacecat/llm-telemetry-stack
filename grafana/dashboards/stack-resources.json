@@ -183,7 +183,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT max(total) AS peak FROM ( SELECT toStartOfMinute(TimeUnix) AS minute, sum(Value) AS total FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.memory.usage.total' AND $__timeFilter(TimeUnix) GROUP BY minute)",
+          "rawSql": "SELECT max(total) AS peak FROM ( SELECT minute, sum(memory) AS total FROM ( SELECT toStartOfMinute(TimeUnix) AS minute, ResourceAttributes['compose.service'] AS container, max(Value) AS memory FROM otel.otel_metrics_sum WHERE ServiceName = 'container-stats' AND MetricName = 'container.memory.usage.total' AND $__timeFilter(TimeUnix) GROUP BY minute, container) GROUP BY minute)",
           "refId": "A"
         }
       ],

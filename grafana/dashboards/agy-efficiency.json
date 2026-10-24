@@ -336,7 +336,7 @@
         "colorMode": "none",
         "textMode": "value_and_name"
       },
-      "description": "Tool calls you approved or rejected by hand."
+      "description": "Tool calls that asked for your approval, including prompts left unanswered when the session went idle."
     },
     {
       "id": 7,
@@ -724,7 +724,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT LogAttributes['tool_name'] AS tool, LogAttributes['scope'] AS scope, LogAttributes['source'] AS source, countIf(LogAttributes['decision'] = 'accept') AS accepted, countIf(LogAttributes['decision'] = 'reject') AS rejected FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'agy.tool_decision' AND $__timeFilter(Timestamp) GROUP BY tool, scope, source ORDER BY accepted + rejected DESC",
+          "rawSql": "SELECT LogAttributes['tool_name'] AS tool, LogAttributes['scope'] AS scope, LogAttributes['source'] AS source, countIf(LogAttributes['decision'] = 'accept') AS accepted, countIf(LogAttributes['decision'] = 'reject') AS rejected, countIf(LogAttributes['decision'] = 'unanswered') AS unanswered FROM otel.otel_logs WHERE LogAttributes['event.name'] = 'agy.tool_decision' AND $__timeFilter(Timestamp) GROUP BY tool, scope, source ORDER BY count() DESC",
           "refId": "A"
         }
       ],
@@ -733,7 +733,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "source config: an allow or protection rule decided. user_prompt / user: you were asked."
+      "description": "source config: an allow or protection rule decided. user_prompt / user: you were asked. unanswered: the prompt was still waiting when the session went idle."
     },
     {
       "id": 17,

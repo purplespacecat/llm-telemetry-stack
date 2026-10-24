@@ -46,11 +46,13 @@ You need Docker with the `docker compose` plugin.
 
 There are three dashboards for Claude Code and three for Antigravity, linked from each other's header. **Claude Code cost** opens as the home page, with no login.
 
-- **Cost:** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, source (main loop, subagents, skills, MCP servers) and session
+- **Cost:** spend, cost per session and per active hour, tokens, cache hit ratio; cost by model, repository, source (main loop, subagents, skills, MCP servers) and session. Claude Code also shows background requests by source, context size per session, compactions, tokens by model, and subagent runs with their model and cost.
 - **Efficiency:** active time, lines of code, commits and pull requests; which skills ran, whether you or the agent triggered them, and sessions with no skills; tool latency, permission prompts and decisions; MCP servers used. Claude Code also shows hooks and hook time, and Antigravity shows subagents.
 - **Reliability:** API errors, error rate, latency and failed calls; failed tool calls by tool and error type. Claude Code also shows exhausted retries, MCP connection failures and hook errors, and Antigravity shows permission denials and subagent failures.
 
 Cost is priced at API list rates. On a Pro, Max, Team or Enterprise plan it isn't what you pay; check your limits with `/usage` in Claude Code.
+
+Every request re-sends the whole conversation, so context size drives most of the cost. If **Context size** stays high, run `/compact` or start a new session instead of resuming an old one.
 
 ## Privacy
 

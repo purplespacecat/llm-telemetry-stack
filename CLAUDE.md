@@ -48,6 +48,14 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 - Block I/O is reported per device, and a write to an encrypted or LVM volume is counted on the mapper and again on the disk under it. `metrics_transform/collapse-devices` keeps the largest value across devices, and only `read` and `write` are kept.
 - At 60 s intervals it stores 6 series per container, about 43,000 rows a day for five containers, under the tables' one-year TTL.
 
+## ClickHouse's own logs
+
+- `clickhouse/config.d/logs.xml` sends the server log to the console at `information` level, so `docker compose logs clickhouse` shows it. The image's default logs at trace level to files inside the container, rotated at 10 × 1 GB; a mostly idle stack wrote 192 MB in 10 hours. Each start logs four `Listen [0.0.0.0]:… Address already in use` warnings: the image's `docker_related_config.xml` listens on both `::` and `0.0.0.0`, and `::` already took the IPv4 ports. They are harmless.
+- It removes the `system` log tables nothing here reads: `text_log`, `trace_log`, `metric_log`, `asynchronous_metric_log`, `query_metric_log`, `part_log`, `processors_profile_log` and `background_schedule_pool_log`. `query_log` and `error_log` are kept for 7 days, and `asynchronous_insert_log` keeps the image's 3-day TTL. With the image's defaults, 10 mostly idle hours left 96 MiB of active parts and 235 MiB of merged parts awaiting deletion in `system`, against 0.7 MiB of telemetry. Each table flushes a new part every 7.5 s, and those parts are merged and logged to `part_log` and `text_log`, so most of the volume was ClickHouse logging its own logging. Removing them took an idle ClickHouse from 11% of a CPU core to 6%, and from 221 kB/s of disk writes to 7 kB/s.
+- Removing a table from the config stops the writes but keeps the table and its data. Changing a kept table's definition, such as its TTL, renames the old table to `<name>_0`, which has no TTL, and creates a new one. The README's cleanup command drops both kinds. A dropped table leaves the disk 8 minutes later (`database_atomic_delay_before_drop_table_sec`).
+- A ClickHouse upgrade can add new log tables with no TTL. After upgrading, list them with `SELECT name FROM system.tables WHERE database = 'system' AND engine LIKE '%MergeTree'`.
+- `logs.xml` is a single-file bind mount like `users.d/grafana.xml`, and the logger and system log settings are read at startup. Run `docker compose restart clickhouse` after editing it.
+
 ## Access
 
 - Grafana queries ClickHouse as `grafana`, defined in `clickhouse/users.d/grafana.xml` with `SELECT ON otel.*`, `SELECT` on `system.parts` and `system.disks` for the storage panels, and `SHOW TABLES ON system.*` so `system.parts` lists ClickHouse's own tables too. It can't read the contents of any other system table, such as `system.query_log`; a panel that tries fails with `ACCESS_DENIED`.
@@ -68,7 +76,6 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 
 - Rootless Podman with SELinux enforcing needs the README workaround. Bind sources under `$HOME` are labelled `user_home_t`, which containers can't read, so every bind mount fails. Rootless Podman also maps container UIDs above 0 into the user's subordinate UID range, so the exporter's default UID 1000 can't read conversation files with mode 0600. Container root maps to the host user. Don't fix this by relabelling (`:z`): on `~/.gemini` it would rewrite the SELinux labels of the user's own files.
 - Grafana 13 downloads updates for its bundled data source plugins (Loki, Tempo, Elasticsearch and others) from grafana.com at every start; look for `plugin.backgroundinstaller` in its log. No telemetry leaves the machine, but the README doesn't mention the traffic.
-- ClickHouse's own logs in the `system` database grow for as long as the stack runs; most of those tables have no TTL. In the first hour of an idle stack they held 9.8 MiB against 0.6 MiB of telemetry, and ClickHouse used about 10% of a CPU core and wrote about 100 kB/s. The Stack resources dashboard shows both.
 
 ## Generating test data
 

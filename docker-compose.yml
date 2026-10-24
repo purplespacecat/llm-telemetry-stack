@@ -10,6 +10,7 @@ services:
       GRAFANA_CLICKHOUSE_PASSWORD: ${GRAFANA_CLICKHOUSE_PASSWORD:-grafana}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/config.d/logs.xml:/etc/clickhouse-server/config.d/logs.xml:ro
       - ./clickhouse/users.d/grafana.xml:/etc/clickhouse-server/users.d/grafana.xml:ro
     ulimits:
       nofile:

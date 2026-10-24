@@ -239,7 +239,7 @@
     {
       "type": "stat",
       "title": "ClickHouse logs",
-      "description": "Disk space ClickHouse's own logs use (the system database: queries, server log, metrics), now. Most of these tables have no expiry.",
+      "description": "Disk space ClickHouse's own logs use (the system database), now. The stack keeps only the query, error and asynchronous insert logs, for a week or less.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse"

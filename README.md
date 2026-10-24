@@ -143,4 +143,11 @@ ORDER BY day DESC
   ```
 
   Start the stack with `podman compose` in place of `docker compose`. It needs the `docker-compose` binary on your `PATH` and the Podman socket running (`systemctl --user start podman.socket`).
+- **Stack resources shows large ClickHouse logs after an upgrade:** earlier versions of this stack kept ClickHouse's internal logs with no expiry. Drop the old tables once:
+
+  ```bash
+  docker compose exec clickhouse clickhouse-client --user otel --password otel -q "DROP TABLE IF EXISTS
+    system.text_log, system.trace_log, system.metric_log, system.asynchronous_metric_log, system.query_metric_log,
+    system.part_log, system.processors_profile_log, system.background_schedule_pool_log, system.query_log_0, system.error_log_0"
+  ```
 - **Organisation-managed settings:** a managed `OTEL_EXPORTER_OTLP_ENDPOINT` replaces yours, and Bash commands and file paths then go to that collector unfiltered. Remove `OTEL_LOG_TOOL_DETAILS` if that matters to you.

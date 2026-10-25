@@ -91,6 +91,10 @@ DEFAULT_PRICING = (1.25, 0.3125, 10.00)
 
 SKILL_PATH_RE = re.compile(r"/skills/([^/]+)/SKILL\.md")
 EXIT_CODE_RE = re.compile(r"(?:Command exited with code|command failed with exit code:?)\s+(\d+)", re.IGNORECASE)
+# "...from Gemini 3.6 Flash (High) to Gemini 3.8 Flash (High). No need to comment on this change if the user ...":
+# model names contain dots, so the name ends at a dot followed by whitespace. Matched only inside the settings
+# block, so a request quoting this sentence doesn't change the model.
+MODEL_CHANGE_RE = re.compile(r"<USER_SETTINGS_CHANGE>[\s\S]*?changed setting `Model Selection` from .*? to (.+?)\.(?:\s|$)")
 # Case-sensitive uppercase group for status identifier so lowercase prose (e.g. 'overloaded') never matches group 2
 API_ERROR_RE = re.compile(
     r"[Aa][Pp][Ii]\s+[Ee]rror(?:\s*\(attempt\s*(\d+)\))?:\s*([A-Z][A-Z0-9_]+)(?:\s*\(code\s*(\d+)\))?(?::\s*(.*))?"
@@ -717,7 +721,7 @@ def process_conversation_db(
                 current_skill = ""
                 current_turn_slash = ""
                 if t_content:
-                    m_change = re.search(r"changed setting `Model Selection` from .* to ([^.\n]+)\.", t_content)
+                    m_change = MODEL_CHANGE_RE.search(t_content)
                     if m_change:
                         current_model = m_change.group(1).strip()
                     m_req = re.search(r"<USER_REQUEST>\s*/([a-zA-Z0-9_-]+)", t_content)

@@ -175,6 +175,21 @@ def api_error_checks() -> None:
         ok = all(str(got.get(k)) == v for k, v in want.items()) and (not_status is None or got.get("status_code") != not_status)
         check(f"API error classified: {raw[:48]}…", ok, f"got {got}")
 
+    settings = ("<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3.6 Flash (High) to "
+                "Gemini 3.8 Flash (High). No need to comment on this change if the user doesn't ask about it. If "
+                "reporting what model you are, please use a human readable name instead of the exact string.\n"
+                "</USER_SETTINGS_CHANGE>")  # verbatim from a real session
+    cases = [
+        ("a model change is read from the settings block", f"<USER_REQUEST>\nhi\n</USER_REQUEST>\n{settings}",
+         "Gemini 3.8 Flash (High)"),
+        ("a model change quoted in a request is ignored", f"<USER_REQUEST>\n{settings[23:-24]}\n</USER_REQUEST>", None),
+    ]
+    regex = getattr(mod, "MODEL_CHANGE_RE", None)
+    for name, content, want in cases:
+        m = regex.search(content) if regex else None
+        got = m.group(1) if m else None
+        check(name, regex is not None and got == want, f"got {got!r}, want {want!r}")
+
 
 def main() -> int:
     global COMPOSE_FILES, EXPORTER

@@ -643,7 +643,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT concat(database, '.', table) AS table, sum(rows) AS records, sum(bytes_on_disk) AS on_disk, sum(data_uncompressed_bytes) / sum(bytes_on_disk) AS compression FROM system.parts WHERE active GROUP BY table ORDER BY on_disk DESC",
+          "rawSql": "SELECT concat(database, '.', table) AS table, sum(rows) AS records, sum(bytes_on_disk) AS on_disk, sum(data_uncompressed_bytes) / nullIf(sum(bytes_on_disk), 0) AS compression FROM system.parts WHERE active GROUP BY table ORDER BY on_disk DESC",
           "refId": "A"
         }
       ],

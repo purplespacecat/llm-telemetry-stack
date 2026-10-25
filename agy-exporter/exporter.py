@@ -712,7 +712,9 @@ def process_conversation_db(
             t_content = str(t_step.get("content") or "")
             t_err = str(t_step.get("error") or "")
 
+            # A new user turn: a skill read in an earlier turn no longer drives what the model does.
             if stype == 14:
+                current_skill = ""
                 current_turn_slash = ""
                 if t_content:
                     m_change = re.search(r"changed setting `Model Selection` from .* to ([^.\n]+)\.", t_content)
@@ -808,8 +810,19 @@ def process_conversation_db(
                 continue
 
             f = parse_wire(g_data)
+            gen_msgs = wire_msg_list(f, 1)
+            gen_kvs = [{wire_str(x, 1): wire_str(x, 2) for x in wire_msg_list(gm, 20)} for gm in gen_msgs]
             step_indices = parse_packed_varints(wire_bytes(f, 2))
             first_step_idx: int | None = step_indices[0] if step_indices else None
+            # Without step indices, the planner step follows `last_step_index`. Resolve it before the
+            # in-flight check, which would otherwise never see this generation's planner step.
+            if first_step_idx is None:
+                kv = next((kv for kv in gen_kvs if "last_step_index" in kv), None)
+                if kv is not None:
+                    try:
+                        first_step_idx = int(kv["last_step_index"]) + 1
+                    except ValueError:
+                        first_step_idx = 0
 
             # Defer a generation whose planner step is still streaming, so its usage is read once complete.
             # Never `break`: later generations must not wait behind this one.
@@ -823,14 +836,7 @@ def process_conversation_db(
                 last_log_gen_idx = max(last_log_gen_idx, g_idx)
                 continue
 
-            for gm in wire_msg_list(f, 1):
-                kv = {wire_str(x, 1): wire_str(x, 2) for x in wire_msg_list(gm, 20)}
-                if first_step_idx is None and "last_step_index" in kv:
-                    try:
-                        first_step_idx = int(kv["last_step_index"]) + 1
-                    except ValueError:
-                        first_step_idx = 0
-
+            for gm, kv in zip(gen_msgs, gen_kvs):
                 resolved_step_idx = first_step_idx if first_step_idx is not None else 0
 
                 model_display = wire_str(gm, 21)

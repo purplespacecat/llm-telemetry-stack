@@ -585,7 +585,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT Attributes['session.id'] AS session, any(Attributes['vcs.repository.name']) AS repository, min(TimeUnix) AS started, max(TimeUnix) AS last_seen, sumIf(Value, MetricName = 'agy.cost.usage') AS cost_usd, sumIf(Value, MetricName = 'agy.token.usage') AS tokens FROM otel.otel_metrics_sum WHERE MetricName IN ('agy.cost.usage', 'agy.token.usage') AND $__timeFilter(TimeUnix) GROUP BY session ORDER BY cost_usd DESC LIMIT 20",
+          "rawSql": "SELECT Attributes['session.id'] AS session, coalesce(nullIf(anyIf(Attributes['vcs.repository.name'], Attributes['vcs.repository.name'] != ''), ''), '(not recorded)') AS repository, min(TimeUnix) AS started, max(TimeUnix) AS last_seen, sumIf(Value, MetricName = 'agy.cost.usage') AS cost_usd, sumIf(Value, MetricName = 'agy.token.usage') AS tokens FROM otel.otel_metrics_sum WHERE MetricName IN ('agy.cost.usage', 'agy.token.usage') AND $__timeFilter(TimeUnix) GROUP BY session ORDER BY cost_usd DESC LIMIT 20",
           "refId": "A"
         }
       ],

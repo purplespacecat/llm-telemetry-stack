@@ -335,6 +335,16 @@ def main() -> int:
               f"exited={ds2['exited']}, sent {ds2['items_ingested']} items ({ds2['duplicates_ingested']} duplicates) "
               f"after the restart, damaged file kept={ds2['state_file_unchanged']}")
 
+        sk = scenario("skill-per-turn", snap, work)[0]
+        check("a skill is credited only with requests in the user turn that read it", sk["later_turn"] == 0,
+              f"{sk['later_turn']} of {sk['credited']} skill-credited requests are from a later turn")
+
+        ug1, ug2 = scenario("unindexed-generation", snap, work)
+        check("a generation without step indices waits for its planner step to finish",
+              ug1["api_requests"] == ug1["generations"] - 1 and ug2["api_requests"] == 1,
+              f"{ug1['api_requests']}/{ug1['generations']} requests exported while the step streamed, "
+              f"{ug2['api_requests']} when it finished (want {ug1['generations'] - 1}, then 1)")
+
         base_only = agy_mounts([REPO / "docker-compose.yml"])
         check("the base compose file mounts no Antigravity data (each surface is an opt-in override)",
               not base_only, f"docker-compose.yml alone mounts {[rel for _, rel in base_only]}")

@@ -14,7 +14,7 @@ usage: smoke.py <scenario> <exporter.py> <gemini_dir> <work_dir>
 scenarios: baseline | unwritable-state | partial-success | poisoned-conversation | body-limit |
            compose-mounts | long-running-step | crashed-session | misconfigured-endpoint |
            subbatch-partial-failure | poisoned-record | close-on-large | save-fails-after-post |
-           damaged-state | skill-per-turn
+           damaged-state | skill-per-turn | unindexed-generation
 """
 import collections
 import contextlib
@@ -326,6 +326,38 @@ def set_writable(root: Path, writable: bool) -> None:
         for p in [Path(dirpath)] + [Path(dirpath) / f for f in files]:
             mode = p.stat().st_mode
             p.chmod(mode | 0o200 if writable else mode & ~0o222)
+
+
+def strip_field(blob: bytes, field: int) -> bytes:
+    """Remove every occurrence of a top-level field from an encoded protobuf message."""
+    def varint(i):
+        n = shift = 0
+        while True:
+            b = blob[i]
+            n |= (b & 0x7F) << shift
+            i, shift = i + 1, shift + 7
+            if b < 0x80:
+                return n, i
+
+    out, i = bytearray(), 0
+    while i < len(blob):
+        start = i
+        key, i = varint(i)
+        wire_type = key & 7
+        if wire_type == 0:
+            _, i = varint(i)
+        elif wire_type == 1:
+            i += 8
+        elif wire_type == 2:
+            n, i = varint(i)
+            i += n
+        elif wire_type == 5:
+            i += 4
+        else:
+            raise ValueError(f"unsupported wire type {wire_type}")
+        if key >> 3 != field:
+            out += blob[start:i]
+    return bytes(out)
 
 
 def set_idle(db: Path, seconds: float) -> None:
@@ -668,6 +700,36 @@ elif SCENARIO == "skill-per-turn":
                 later_turn += 1
     print("@@" + json.dumps({"cycle": "1 cold start", "credited": credited, "later_turn": later_turn,
                              "unmatched": unmatched}))
+
+elif SCENARIO == "unindexed-generation":
+    # A generation that lists no step indices, whose planner step is still streaming. It must wait for
+    # that step like any other generation, or its usage is read before it is final.
+    gemini, db, _ = build_fixture("unindexed-generation")
+    os.environ["GEMINI_DIR"] = str(gemini)
+    probe = load_module()
+    c = sqlite3.connect(db)
+    for g_idx, data in c.execute("select idx, data from gen_metadata order by idx desc").fetchall():
+        f = probe.parse_wire(data)
+        steps = probe.parse_packed_varints(probe.wire_bytes(f, 2))
+        kvs = [{probe.wire_str(x, 1): probe.wire_str(x, 2) for x in probe.wire_msg_list(gm, 20)}
+               for gm in probe.wire_msg_list(f, 1)]
+        if steps and any(kv.get("last_step_index") == str(steps[0] - 1) for kv in kvs):
+            break
+    else:
+        sys.exit("no generation in the fixture records last_step_index")
+    total = c.execute("select count(*) from gen_metadata").fetchone()[0]
+    c.execute("update gen_metadata set data = ? where idx = ?", (strip_field(data, 2), g_idx))
+    c.execute("update steps set status = 2 where idx = ?", (steps[0],))
+    c.commit()
+    mod = load_module(); st = mod.load_state()
+    first = cycle(mod, st, "1 planner step streaming", quiet=True)
+    c.execute("update steps set status = 3 where idx = ?", (steps[0],))
+    c.commit()
+    c.close()
+    second = cycle(mod, st, "2 planner step done", quiet=True)
+    for label, out in (("1 planner step streaming", first), ("2 planner step done", second)):
+        print("@@" + json.dumps({"cycle": label, "generations": total,
+                                 "api_requests": out["emitted"].get("agy.api_request", 0)}))
 
 else:
     sys.exit(f"unknown scenario {SCENARIO}")

@@ -712,7 +712,9 @@ def process_conversation_db(
             t_content = str(t_step.get("content") or "")
             t_err = str(t_step.get("error") or "")
 
+            # A new user turn: a skill read in an earlier turn no longer drives what the model does.
             if stype == 14:
+                current_skill = ""
                 current_turn_slash = ""
                 if t_content:
                     m_change = re.search(r"changed setting `Model Selection` from .* to ([^.\n]+)\.", t_content)

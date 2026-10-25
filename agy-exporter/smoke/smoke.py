@@ -14,7 +14,7 @@ usage: smoke.py <scenario> <exporter.py> <gemini_dir> <work_dir>
 scenarios: baseline | unwritable-state | partial-success | poisoned-conversation | body-limit |
            compose-mounts | long-running-step | crashed-session | misconfigured-endpoint |
            subbatch-partial-failure | poisoned-record | close-on-large | save-fails-after-post |
-           damaged-state
+           damaged-state | skill-per-turn
 """
 import collections
 import contextlib
@@ -144,6 +144,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rec["abandoned"] = sum(1 for k, n, a in records if n == "agy.tool_result" and a.get("error_type") == "abandoned")
         rec["unknown_tools"] = sum(1 for k, n, a in records if n == "agy.tool_result" and a.get("tool_name") == "unknown")
         rec["decisions"] = collections.Counter(a.get("decision") for k, n, a in records if n == "agy.tool_decision")
+        rec["api_requests"] = [(a["session.id"], int(fp[2]), a.get("skill.name", ""))
+                               for fp in fps if fp[:2] == ("l", "agy.api_request") for a in [json.loads(fp[3])]]
         rec["status"] = 200
         if C.mode == "partial":
             key = "rejectedDataPoints" if self.path.endswith("/metrics") else "rejectedLogRecords"
@@ -623,6 +625,49 @@ elif SCENARIO == "damaged-state":
     state_file.write_bytes(damaged)
     report("2 restart with state.json cut in half, 2 polls", run_main(load_module(), polls=2),
            state_file_unchanged=state_file.read_bytes() == damaged)
+
+elif SCENARIO == "skill-per-turn":
+    # Reading a skill's SKILL.md shapes the rest of that user turn. Requests in later turns must not
+    # be credited to it, or one skill read early in a long conversation takes most of its cost.
+    mod = load_module(); st = mod.load_state()
+    cycle(mod, st, "1 cold start", quiet=True)
+    by_session = collections.defaultdict(list)
+    for p in C.posts:
+        for sid, ts, skill in p.get("api_requests", []):
+            if skill:
+                by_session[sid].append((ts, skill))
+    credited = later_turn = unmatched = 0
+    for sid, reqs in by_session.items():
+        c = sqlite3.connect(f"file:{find_db(sid)}?mode=ro&immutable=1", uri=True)
+        idx_by_ts, turn_starts, activations = {}, [], []
+        for idx, stype, status, meta in c.execute("select idx, step_type, status, metadata from steps order by idx"):
+            m = mod.parse_wire(meta)
+            ts = mod.proto_ts_ns(mod.wire_msg(m, 1))
+            if ts:
+                idx_by_ts[ts] = idx
+            if stype == 14:
+                turn_starts.append(idx)
+            tc = mod.wire_msg(m, 4)
+            try:
+                args = json.loads(mod.wire_str(tc, 3) or "{}")
+            except ValueError:
+                args = {}
+            # Looser than the exporter's success test, so the check can only under-report.
+            act = mod.extract_activated_skill(mod.wire_str(tc, 2), args if isinstance(args, dict) else {}, status == 3)
+            if act:
+                activations.append((idx, act[0]))
+        c.close()
+        for ts, skill in reqs:
+            if ts not in idx_by_ts:
+                unmatched += 1
+                continue
+            credited += 1
+            i = idx_by_ts[ts]
+            turn = max((u for u in turn_starts if u <= i), default=-1)
+            if not any(name == skill and turn < a <= i for a, name in activations):
+                later_turn += 1
+    print("@@" + json.dumps({"cycle": "1 cold start", "credited": credited, "later_turn": later_turn,
+                             "unmatched": unmatched}))
 
 else:
     sys.exit(f"unknown scenario {SCENARIO}")

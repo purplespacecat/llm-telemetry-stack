@@ -14,7 +14,7 @@ usage: smoke.py <scenario> <exporter.py> <gemini_dir> <work_dir>
 scenarios: baseline | unwritable-state | partial-success | poisoned-conversation | body-limit |
            compose-mounts | long-running-step | crashed-session | misconfigured-endpoint |
            subbatch-partial-failure | poisoned-record | close-on-large | save-fails-after-post |
-           damaged-state | skill-per-turn | unindexed-generation
+           damaged-state | skill-per-turn | unindexed-generation | split-polls
 """
 import collections
 import contextlib
@@ -662,7 +662,7 @@ elif SCENARIO == "skill-per-turn":
     # Reading a skill's SKILL.md shapes the rest of that user turn. Requests in later turns must not
     # be credited to it, or one skill read early in a long conversation takes most of its cost.
     mod = load_module(); st = mod.load_state()
-    cycle(mod, st, "1 cold start", quiet=True)
+    activated = cycle(mod, st, "1 cold start", quiet=True)["emitted"].get("agy.skill_activated", 0)
     by_session = collections.defaultdict(list)
     for p in C.posts:
         for sid, ts, skill in p.get("api_requests", []):
@@ -698,8 +698,8 @@ elif SCENARIO == "skill-per-turn":
             turn = max((u for u in turn_starts if u <= i), default=-1)
             if not any(name == skill and turn < a <= i for a, name in activations):
                 later_turn += 1
-    print("@@" + json.dumps({"cycle": "1 cold start", "credited": credited, "later_turn": later_turn,
-                             "unmatched": unmatched}))
+    print("@@" + json.dumps({"cycle": "1 cold start", "activated": activated, "credited": credited,
+                             "later_turn": later_turn, "unmatched": unmatched}))
 
 elif SCENARIO == "unindexed-generation":
     # A generation that lists no step indices, whose planner step is still streaming. It must wait for
@@ -730,6 +730,99 @@ elif SCENARIO == "unindexed-generation":
     for label, out in (("1 planner step streaming", first), ("2 planner step done", second)):
         print("@@" + json.dumps({"cycle": label, "generations": total,
                                  "api_requests": out["emitted"].get("agy.api_request", 0)}))
+
+elif SCENARIO == "split-polls":
+    # A conversation exported over two polls must produce the same records as one cold start. Each
+    # conversation is cut before an API error and at a few other steps: poll 1 sees it as it stood then,
+    # with later steps missing and tool calls of already-written generations still running.
+    mod = load_module()
+    out_root = WORK / "split-polls"
+
+    def first_step(data):
+        f = mod.parse_wire(data)
+        steps = mod.parse_packed_varints(mod.wire_bytes(f, 2))
+        if steps:
+            return steps[0], steps
+        for gm in mod.wire_msg_list(f, 1):
+            kv = {mod.wire_str(x, 1): mod.wire_str(x, 2) for x in mod.wire_msg_list(gm, 20)}
+            if kv.get("last_step_index", "").isdigit():
+                return int(kv["last_step_index"]) + 1, []
+        return None, []
+
+    def transcript_step(line):
+        try:
+            return int(json.loads(line).get("step_index", -1))
+        except (ValueError, TypeError, AttributeError):
+            return -1
+
+    def place(src_db, cut):
+        surface_dir = out_root / src_db.parts[-3]
+        db = surface_dir / "conversations" / src_db.name
+        db.parent.mkdir(parents=True, exist_ok=True)
+        for p in db.parent.glob(f"{src_db.name}*"):
+            p.unlink()
+        source, dest = sqlite3.connect(f"file:{src_db}?mode=ro&immutable=1", uri=True), sqlite3.connect(db)
+        source.backup(dest)
+        source.close()
+        if cut is not None:
+            running = set()
+            for g_idx, data in dest.execute("select idx, data from gen_metadata").fetchall():
+                start, steps = first_step(data)
+                if start is None or start >= cut:
+                    dest.execute("delete from gen_metadata where idx = ?", (g_idx,))
+                else:
+                    running |= {s for s in steps if s >= cut}
+            dest.execute(f"delete from steps where idx >= ? and idx not in ({','.join('?' * len(running))})",
+                         (cut, *running))
+            dest.execute("update steps set status = 2 where idx >= ?", (cut,))
+        dest.commit()
+        dest.close()
+        src_tr = src_db.parent.parent / "brain" / src_db.stem / ".system_generated" / "logs" / "transcript.jsonl"
+        tr = surface_dir / "brain" / src_db.stem / ".system_generated" / "logs" / "transcript.jsonl"
+        tr.parent.mkdir(parents=True, exist_ok=True)
+        lines = src_tr.read_text(encoding="utf-8", errors="replace").splitlines() if src_tr.exists() else []
+        if cut is not None:
+            lines = [l for l in lines if transcript_step(l) < cut]
+        tr.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+        return surface_dir, db
+
+    def records(gen_m, step_m, logs):
+        out = collections.Counter()
+        for metrics in (gen_m, step_m):
+            for name, dps in metrics.items():
+                for dp in dps:
+                    out[json.dumps(["m", name, dp["timeUnixNano"], attrs_of(dp), dp.get("asDouble")], sort_keys=True)] += 1
+        for r in logs:
+            out[json.dumps(["l", r["timeUnixNano"], attrs_of(r), r.get("body")], sort_keys=True)] += 1
+        return out
+
+    replays, differing, examples = 0, 0, []
+    for src_db in sorted(Path(GEMINI).glob("*/conversations/*.db")):
+        surface = "cli" if src_db.parts[-3] == "antigravity-cli" else "app"
+        c = sqlite3.connect(f"file:{src_db}?mode=ro&immutable=1", uri=True)
+        rows = c.execute("select idx, step_type from steps order by idx").fetchall()
+        c.close()
+        if len(rows) < 2:
+            continue
+        cuts = {idx for idx, stype in rows if stype in (17, 23)} | {rows[len(rows) * k // 5][0] for k in (1, 2, 3, 4)}
+        surface_dir, db = place(src_db, None)
+        cold = records(*mod.process_conversation_db(surface, surface_dir, db, {}, {}, TMP)[:3])
+        for cut in sorted(cuts - {rows[0][0]}):
+            replays += 1
+            surface_dir, db = place(src_db, cut)
+            g1, s1, l1, conv_state, _ = mod.process_conversation_db(surface, surface_dir, db, {}, {}, TMP)
+            conv_state = json.loads(json.dumps(conv_state))
+            surface_dir, db = place(src_db, None)
+            g2, s2, l2, _, _ = mod.process_conversation_db(surface, surface_dir, db, {}, conv_state, TMP)
+            split = records(g1, s1, l1) + records(g2, s2, l2)
+            if split != cold:
+                differing += 1
+                if len(examples) < 3:
+                    only_split = sorted((split - cold).elements())[:1]
+                    only_cold = sorted((cold - split).elements())[:1]
+                    examples.append({"cid": src_db.stem[:8], "cut": cut, "cold": only_cold, "split": only_split})
+    print("@@" + json.dumps({"cycle": "split at each cut", "replays": replays, "differing": differing,
+                             "examples": examples}))
 
 else:
     sys.exit(f"unknown scenario {SCENARIO}")

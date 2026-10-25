@@ -91,6 +91,10 @@ DEFAULT_PRICING = (1.25, 0.3125, 10.00)
 
 SKILL_PATH_RE = re.compile(r"/skills/([^/]+)/SKILL\.md")
 EXIT_CODE_RE = re.compile(r"(?:Command exited with code|command failed with exit code:?)\s+(\d+)", re.IGNORECASE)
+# "...from Gemini 3.6 Flash (High) to Gemini 3.8 Flash (High). No need to comment on this change if the user ...":
+# model names contain dots, so the name ends at a dot followed by whitespace. Matched only inside the settings
+# block, so a request quoting this sentence doesn't change the model.
+MODEL_CHANGE_RE = re.compile(r"<USER_SETTINGS_CHANGE>[\s\S]*?changed setting `Model Selection` from .*? to (.+?)\.(?:\s|$)")
 # Case-sensitive uppercase group for status identifier so lowercase prose (e.g. 'overloaded') never matches group 2
 API_ERROR_RE = re.compile(
     r"[Aa][Pp][Ii]\s+[Ee]rror(?:\s*\(attempt\s*(\d+)\))?:\s*([A-Z][A-Z0-9_]+)(?:\s*\(code\s*(\d+)\))?(?::\s*(.*))?"
@@ -670,7 +674,10 @@ def process_conversation_db(
         ).fetchall()
 
         min_needed_step = min([min_step_idx + 1] + list(all_pending_steps)) if all_pending_steps else (min_step_idx + 1)
-        transcript_steps = load_transcript_map(surface_dir, cid, min_step_idx=max(0, min_needed_step))
+        # From the start of that step's user turn: whether an earlier step in the turn read a skill depends
+        # on its transcript entry too.
+        turn_start = max((row[0] for row in step_rows if row[1] == 14 and row[0] <= min_needed_step), default=0)
+        transcript_steps = load_transcript_map(surface_dir, cid, min_step_idx=turn_start)
 
         parsed_steps: list[
             tuple[
@@ -717,7 +724,7 @@ def process_conversation_db(
                 current_skill = ""
                 current_turn_slash = ""
                 if t_content:
-                    m_change = re.search(r"changed setting `Model Selection` from .* to ([^.\n]+)\.", t_content)
+                    m_change = MODEL_CHANGE_RE.search(t_content)
                     if m_change:
                         current_model = m_change.group(1).strip()
                     m_req = re.search(r"<USER_REQUEST>\s*/([a-zA-Z0-9_-]+)", t_content)
@@ -796,19 +803,15 @@ def process_conversation_db(
             conv_state["session_counted"] = True
 
         # 2. Process gen_metadata (API requests, tokens, cost, latency, TTFT)
-        gen_rows = conn.execute(
-            "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx ASC", (min_gen_idx,)
-        ).fetchall()
+        # Read every generation, exported or not: each one gives its steps their model and source, and a step
+        # exported on a later poll (an API error, a tool call that outlives its generation's export) must get
+        # the same ones as on a cold start.
+        gen_rows = conn.execute("SELECT idx, data FROM gen_metadata ORDER BY idx ASC").fetchall()
 
         new_pending_metric_gens: set[int] = set()
         new_pending_log_gens: set[int] = set()
 
         for g_idx, g_data in gen_rows:
-            need_gen_metric = (g_idx > last_metric_gen_idx) or (g_idx in pending_metric_gens)
-            need_gen_log = (g_idx > last_log_gen_idx) or (g_idx in pending_log_gens)
-            if not need_gen_metric and not need_gen_log:
-                continue
-
             f = parse_wire(g_data)
             gen_msgs = wire_msg_list(f, 1)
             gen_kvs = [{wire_str(x, 1): wire_str(x, 2) for x in wire_msg_list(gm, 20)} for gm in gen_msgs]
@@ -823,6 +826,26 @@ def process_conversation_db(
                         first_step_idx = int(kv["last_step_index"]) + 1
                     except ValueError:
                         first_step_idx = 0
+            resolved_step_idx = first_step_idx if first_step_idx is not None else 0
+
+            gen_turns = []
+            for gm, kv in zip(gen_msgs, gen_kvs):
+                model_display = wire_str(gm, 21)
+                model_slug = wire_str(gm, 19)
+                model_name = model_display or model_slug or model_by_step.get(resolved_step_idx, "auto") or "unknown"
+                root_cid = kv.get("root_cascade_id", "")
+                casc_id = kv.get("cascade_id", "")
+                turn_source = "subagent" if (root_cid and casc_id and root_cid != casc_id) else query_source
+                # Propagate generation's model and source to its step range for accurate step/error attribution
+                for s_i in step_indices or [resolved_step_idx]:
+                    model_by_step[s_i] = model_name
+                    query_source_by_step[s_i] = turn_source
+                gen_turns.append((gm, model_name, turn_source))
+
+            need_gen_metric = (g_idx > last_metric_gen_idx) or (g_idx in pending_metric_gens)
+            need_gen_log = (g_idx > last_log_gen_idx) or (g_idx in pending_log_gens)
+            if not need_gen_metric and not need_gen_log:
+                continue
 
             # Defer a generation whose planner step is still streaming, so its usage is read once complete.
             # Never `break`: later generations must not wait behind this one.
@@ -836,23 +859,7 @@ def process_conversation_db(
                 last_log_gen_idx = max(last_log_gen_idx, g_idx)
                 continue
 
-            for gm, kv in zip(gen_msgs, gen_kvs):
-                resolved_step_idx = first_step_idx if first_step_idx is not None else 0
-
-                model_display = wire_str(gm, 21)
-                model_slug = wire_str(gm, 19)
-                model_name = model_display or model_slug or model_by_step.get(resolved_step_idx, "auto") or "unknown"
-
-                # Propagate generation's model to its step range for accurate step/error attribution
-                for s_i in step_indices or [resolved_step_idx]:
-                    model_by_step[s_i] = model_name
-
-                root_cid = kv.get("root_cascade_id", "")
-                casc_id = kv.get("cascade_id", "")
-                turn_source = "subagent" if (root_cid and casc_id and root_cid != casc_id) else query_source
-                for s_i in step_indices or [resolved_step_idx]:
-                    query_source_by_step[s_i] = turn_source
-
+            for gm, model_name, turn_source in gen_turns:
                 usage = wire_msg(gm, 4)
                 in_tok = wire_int(usage, 2, 0)
                 out_tok = wire_int(usage, 3, 0)

@@ -175,6 +175,21 @@ def api_error_checks() -> None:
         ok = all(str(got.get(k)) == v for k, v in want.items()) and (not_status is None or got.get("status_code") != not_status)
         check(f"API error classified: {raw[:48]}…", ok, f"got {got}")
 
+    settings = ("<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3.6 Flash (High) to "
+                "Gemini 3.8 Flash (High). No need to comment on this change if the user doesn't ask about it. If "
+                "reporting what model you are, please use a human readable name instead of the exact string.\n"
+                "</USER_SETTINGS_CHANGE>")  # verbatim from a real session
+    cases = [
+        ("a model change is read from the settings block", f"<USER_REQUEST>\nhi\n</USER_REQUEST>\n{settings}",
+         "Gemini 3.8 Flash (High)"),
+        ("a model change quoted in a request is ignored", f"<USER_REQUEST>\n{settings[23:-24]}\n</USER_REQUEST>", None),
+    ]
+    regex = getattr(mod, "MODEL_CHANGE_RE", None)
+    for name, content, want in cases:
+        m = regex.search(content) if regex else None
+        got = m.group(1) if m else None
+        check(name, regex is not None and got == want, f"got {got!r}, want {want!r}")
+
 
 def main() -> int:
     global COMPOSE_FILES, EXPORTER
@@ -336,14 +351,24 @@ def main() -> int:
               f"after the restart, damaged file kept={ds2['state_file_unchanged']}")
 
         sk = scenario("skill-per-turn", snap, work)[0]
-        check("a skill is credited only with requests in the user turn that read it", sk["later_turn"] == 0,
-              f"{sk['later_turn']} of {sk['credited']} skill-credited requests are from a later turn")
+        if sk["activated"]:
+            check("a skill is credited only with requests in the user turn that read it",
+                  sk["credited"] > 0 and sk["unmatched"] == 0 and sk["later_turn"] == 0,
+                  f"{sk['later_turn']} of {sk['credited']} skill-credited requests are from a later turn, "
+                  f"{sk['unmatched']} not traced to a step, after {sk['activated']} activations")
+        else:
+            check("a skill is credited only with requests in the user turn that read it (no skill in the data: not exercised)", True)
 
         ug1, ug2 = scenario("unindexed-generation", snap, work)
         check("a generation without step indices waits for its planner step to finish",
               ug1["api_requests"] == ug1["generations"] - 1 and ug2["api_requests"] == 1,
               f"{ug1['api_requests']}/{ug1['generations']} requests exported while the step streamed, "
               f"{ug2['api_requests']} when it finished (want {ug1['generations'] - 1}, then 1)")
+
+        spl = scenario("split-polls", snap, work)[0]
+        check("a conversation exported over two polls gives the same records as one cold start",
+              spl["replays"] > 0 and spl["differing"] == 0,
+              f"{spl['differing']} of {spl['replays']} two-poll replays differ, e.g. {spl['examples'][:1]}")
 
         base_only = agy_mounts([REPO / "docker-compose.yml"])
         check("the base compose file mounts no Antigravity data (each surface is an opt-in override)",

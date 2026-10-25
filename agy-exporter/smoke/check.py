@@ -360,6 +360,11 @@ def main() -> int:
               f"{ug1['api_requests']}/{ug1['generations']} requests exported while the step streamed, "
               f"{ug2['api_requests']} when it finished (want {ug1['generations'] - 1}, then 1)")
 
+        spl = scenario("split-polls", snap, work)[0]
+        check("a conversation exported over two polls gives the same records as one cold start",
+              spl["replays"] > 0 and spl["differing"] == 0,
+              f"{spl['differing']} of {spl['replays']} two-poll replays differ, e.g. {spl['examples'][:1]}")
+
         base_only = agy_mounts([REPO / "docker-compose.yml"])
         check("the base compose file mounts no Antigravity data (each surface is an opt-in override)",
               not base_only, f"docker-compose.yml alone mounts {[rel for _, rel in base_only]}")

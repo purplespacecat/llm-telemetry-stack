@@ -662,7 +662,7 @@ elif SCENARIO == "skill-per-turn":
     # Reading a skill's SKILL.md shapes the rest of that user turn. Requests in later turns must not
     # be credited to it, or one skill read early in a long conversation takes most of its cost.
     mod = load_module(); st = mod.load_state()
-    cycle(mod, st, "1 cold start", quiet=True)
+    activated = cycle(mod, st, "1 cold start", quiet=True)["emitted"].get("agy.skill_activated", 0)
     by_session = collections.defaultdict(list)
     for p in C.posts:
         for sid, ts, skill in p.get("api_requests", []):
@@ -698,8 +698,8 @@ elif SCENARIO == "skill-per-turn":
             turn = max((u for u in turn_starts if u <= i), default=-1)
             if not any(name == skill and turn < a <= i for a, name in activations):
                 later_turn += 1
-    print("@@" + json.dumps({"cycle": "1 cold start", "credited": credited, "later_turn": later_turn,
-                             "unmatched": unmatched}))
+    print("@@" + json.dumps({"cycle": "1 cold start", "activated": activated, "credited": credited,
+                             "later_turn": later_turn, "unmatched": unmatched}))
 
 elif SCENARIO == "unindexed-generation":
     # A generation that lists no step indices, whose planner step is still streaming. It must wait for

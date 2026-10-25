@@ -351,8 +351,13 @@ def main() -> int:
               f"after the restart, damaged file kept={ds2['state_file_unchanged']}")
 
         sk = scenario("skill-per-turn", snap, work)[0]
-        check("a skill is credited only with requests in the user turn that read it", sk["later_turn"] == 0,
-              f"{sk['later_turn']} of {sk['credited']} skill-credited requests are from a later turn")
+        if sk["activated"]:
+            check("a skill is credited only with requests in the user turn that read it",
+                  sk["credited"] > 0 and sk["unmatched"] == 0 and sk["later_turn"] == 0,
+                  f"{sk['later_turn']} of {sk['credited']} skill-credited requests are from a later turn, "
+                  f"{sk['unmatched']} not traced to a step, after {sk['activated']} activations")
+        else:
+            check("a skill is credited only with requests in the user turn that read it (no skill in the data: not exercised)", True)
 
         ug1, ug2 = scenario("unindexed-generation", snap, work)
         check("a generation without step indices waits for its planner step to finish",

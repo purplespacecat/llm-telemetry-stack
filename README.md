@@ -157,6 +157,7 @@ ORDER BY day DESC
   ```
 
   Conversations you have deleted from Antigravity since they were exported can't be exported again.
+- **Antigravity skills take most of your cost:** earlier versions of the exporter credited a skill with every later turn of its conversation. New records are right; to correct the ones already stored, export your history again with the commands in the entry above.
 - **Stack resources shows large ClickHouse logs after an upgrade:** earlier versions of this stack kept ClickHouse's internal logs with no expiry. Drop the old tables once:
 
   ```bash

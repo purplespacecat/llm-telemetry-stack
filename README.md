@@ -65,9 +65,10 @@ Every request re-sends the whole conversation, so context size drives most of th
 
 ## Privacy
 
-- Data stays on your machine. Grafana listens on `127.0.0.1` only, and ClickHouse isn't exposed outside Docker.
+- Data stays on your machine. Grafana and the collector listen on `127.0.0.1` only, and ClickHouse isn't exposed outside Docker.
+- Every account on the machine can reach `127.0.0.1`. Grafana has no login, so on a shared computer other users can open your dashboards, and any program can send data to the collector.
 - Prompts and responses aren't recorded. Your email and account ID are.
-- Skill, agent and MCP names are recorded. The setting that enables them (`OTEL_LOG_TOOL_DETAILS`) also sends Bash commands, file paths and tool arguments; the collector drops those before they're stored.
+- Skill, agent and MCP names are recorded. The setting that enables them (`OTEL_LOG_TOOL_DETAILS`) also sends Bash commands, file paths and tool arguments. The collector drops those before they're stored, and it doesn't accept traces, which would carry them too.
 - To record prompt and response text, add `OTEL_LOG_USER_PROMPTS=1` to the same `env` block.
 - Container stats (setup step 3) mount the Docker socket into a `container-stats` service, and the socket gives full control of Docker. That service has no ports and stores stats only for this stack's containers.
 

@@ -40,7 +40,7 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 
 - The snippet sets `OTEL_LOG_TOOL_DETAILS=1` so skill, agent and MCP names arrive unredacted. Without it, user-defined skills show as `custom_skill`.
 - The same flag adds Bash commands, file paths and arguments. `transform/drop-tool-arguments` in `collector/config.yaml` copies `mcp_server_name` and `mcp_tool_name` out of `tool_parameters`, then deletes `tool_parameters`, `tool_input` and `tool_result`'s `error` before export. `mcp_server_connection` keeps its `error`, which holds connection messages such as `Connection closed`.
-- The filter covers logs only. The snippet doesn't export traces, whose spans would carry `file_path` and `full_command`.
+- The filter covers logs only, and spans carry `file_path` and `full_command`, so `collector/config.yaml` has no traces pipeline and the collector refuses traces. Add a span filter before adding one. Installs from before the pipeline was removed keep their `otel_traces` tables; no panel reads them.
 - Verify after changing the filter: run the test session below with `OTEL_LOG_TOOL_DETAILS=1`, a failing Bash `ls` of a unique string and an MCP call, then confirm the string appears nowhere in `otel.otel_logs` (`Body` or `mapValues(LogAttributes)`) and the MCP call has `mcp_server_name`.
 
 ## Container stats
@@ -67,6 +67,7 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 - ClickHouse reloads `users.d` when it changes, but `users.d/grafana.xml` is a single-file bind mount. An editor that saves by replacing the file leaves the container on the old inode, so run `docker compose restart clickhouse` after editing it.
 - ClickHouse has no host port. Run SQL through `docker compose exec clickhouse clickhouse-client`. Don't publish `8123` or `9000` with the default passwords: any website can send requests to `localhost`, and `otel` can write data out with `INSERT INTO FUNCTION url(...)`.
 - `GF_SERVER_ENFORCE_DOMAIN` redirects any host other than `localhost` to `GF_SERVER_ROOT_URL`, which blocks DNS rebinding. Opening `127.0.0.1:3000` redirects to `localhost:3000`.
+- `127.0.0.1` is reachable from every account on the machine, and anonymous Grafana access shows the dashboards to all of them. The OTLP ports have no authentication and don't check the `Host` header, so any local program can write records, and a web page could too through DNS rebinding.
 - Grafana 13 ignores `GF_AUTH_ANONYMOUS_ORG_ROLE` and logs "only viewer role is supported", so anonymous visitors are always Viewers.
 
 ## Changing the dashboards

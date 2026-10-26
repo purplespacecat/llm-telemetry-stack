@@ -36,6 +36,3 @@ service:
       receivers: [otlp]
       processors: [transform/drop-tool-arguments]
       exporters: [clickhouse]
-    traces:
-      receivers: [otlp]
-      exporters: [clickhouse]

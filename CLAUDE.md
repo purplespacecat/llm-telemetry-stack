@@ -40,7 +40,7 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 
 - The snippet sets `OTEL_LOG_TOOL_DETAILS=1` so skill, agent and MCP names arrive unredacted. Without it, user-defined skills show as `custom_skill`.
 - The same flag adds Bash commands, file paths and arguments. `transform/drop-tool-arguments` in `collector/config.yaml` copies `mcp_server_name` and `mcp_tool_name` out of `tool_parameters`, then deletes `tool_parameters`, `tool_input` and `tool_result`'s `error` before export. `mcp_server_connection` keeps its `error`, which holds connection messages such as `Connection closed`.
-- The filter covers logs only. The snippet doesn't export traces, whose spans would carry `file_path` and `full_command`.
+- The filter covers logs only, and spans carry `file_path` and `full_command`, so `collector/config.yaml` has no traces pipeline and the collector refuses traces. Add a span filter before adding one. Installs from before the pipeline was removed keep their `otel_traces` tables; no panel reads them.
 - Verify after changing the filter: run the test session below with `OTEL_LOG_TOOL_DETAILS=1`, a failing Bash `ls` of a unique string and an MCP call, then confirm the string appears nowhere in `otel.otel_logs` (`Body` or `mapValues(LogAttributes)`) and the MCP call has `mcp_server_name`.
 
 ## Container stats

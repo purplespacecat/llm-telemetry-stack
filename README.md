@@ -120,6 +120,15 @@ ORDER BY day DESC
 - **No Antigravity data:** check `docker compose logs agy-exporter`. If it reports a surface directory not found, that app's file is missing from `COMPOSE_FILE` (setup step 2).
 - **`bind source path does not exist` when starting:** `COMPOSE_FILE` lists an Antigravity app you haven't used on this machine. Remove its file from the line.
 - **Docker installed as a snap (Ubuntu):** keep the repo outside hidden folders and `/tmp`, or the config files mount as empty folders.
+- **`container-stats` keeps restarting with `exec /otelcol-contrib: operation not permitted`:** Docker installed as a snap can't start containers with the `no-new-privileges` option. Save this as `docker-compose.snap.yml` next to `docker-compose.yml`, add it to the end of `COMPOSE_FILE` and run `docker compose up -d`:
+
+  ```yaml
+  services:
+    container-stats:
+      security_opt: !reset []
+  ```
+
+  The service keeps its other restrictions: no Linux capabilities and a read-only file system.
 - **Rootless Podman with SELinux (Fedora, RHEL):** containers can't read the mounted config files, and the Antigravity exporter can't read conversation files that only you can read. Until the compose files handle Podman, save this as `docker-compose.podman.yml` next to `docker-compose.yml`:
 
   ```yaml

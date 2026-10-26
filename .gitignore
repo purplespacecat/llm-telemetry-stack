@@ -1,3 +1,4 @@
 .env
 __pycache__/
 docker-compose.podman.yml
+docker-compose.snap.yml

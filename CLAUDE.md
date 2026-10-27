@@ -81,6 +81,7 @@ Docker Compose stack that stores Claude Code and Antigravity (`agy`) OpenTelemet
 ## Known issues
 
 - Rootless Podman with SELinux enforcing needs the README workaround. Bind sources under `$HOME` are labelled `user_home_t`, which containers can't read, so every bind mount fails. Rootless Podman also maps container UIDs above 0 into the user's subordinate UID range, so the exporter's default UID 1000 can't read conversation files with mode 0600. Container root maps to the host user. Don't fix this by relabelling (`:z`): on `~/.gemini` it would rewrite the SELinux labels of the user's own files.
+- Docker installed as a snap can't start any container with `no-new-privileges`: `exec <entrypoint>: operation not permitted`, whatever the image, and `apparmor=unconfined` doesn't help (snap Docker 29.8.0). dockerd and its shims run under the snap's own AppArmor profile, which blocks the profile change at exec once the flag is set. Only `container-stats` sets it; the README's `docker-compose.snap.yml` resets its `security_opt`.
 - Grafana 13 downloads updates for its bundled data source plugins (Loki, Tempo, Elasticsearch and others) from grafana.com at every start; look for `plugin.backgroundinstaller` in its log. No telemetry leaves the machine, but the README doesn't mention the traffic.
 
 ## Generating test data
